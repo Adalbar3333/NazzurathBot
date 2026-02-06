@@ -7,10 +7,17 @@ import os
 import random
 from collections import defaultdict
 from dotenv import load_dotenv
+from aiohttp import web
+import asyncio
 
 # --- ENV + TOKEN ---
 load_dotenv()
 TOKEN = os.getenv("DISCORD_TOKEN")
+
+# --- GITHUB CONFIG ---
+GITHUB_CHANNEL_ID = int(os.getenv("GITHUB_CHANNEL_ID", 0))
+GITHUB_ROLE_ID = int(os.getenv("GITHUB_ROLE_ID", 0))
+PORT = int(os.getenv("PORT", 8080))
 
 # --- CONFIG ---
 AVRAE_USER_ID = 261302296103747584
@@ -57,24 +64,11 @@ def save_quips(quips):
 async def has_admin_role(interaction: discord.Interaction):
     return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
 
-# --- SLASH COMMANDS ---
+# --------------------------------------------------
+# SLASH COMMANDS
+# --------------------------------------------------
+
 @bot.tree.command(name="announce", description="Announce a message in a channel")
-@app_commands.describe(
-    channel="Channel to send the announcement",
-    desc="Main description of the embed",
-    title="Optional title for the announcement",
-    color="Embed color type",
-    add_update_prefix="Add 'Update: ' to the title",
-    image="URL of the image to include",
-    thumbnail="URL of the thumbnail image",
-    footer="Footer text to include",
-    timestamp="Add timestamp to the embed",
-    field1_title="Title for Field 1", field1_value="Value for Field 1",
-    field2_title="Title for Field 2", field2_value="Value for Field 2",
-    field3_title="Title for Field 3", field3_value="Value for Field 3",
-    field4_title="Title for Field 4", field4_value="Value for Field 4",
-    field5_title="Title for Field 5", field5_value="Value for Field 5",
-)
 async def announce(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
@@ -86,11 +80,6 @@ async def announce(
     thumbnail: str = None,
     footer: str = None,
     timestamp: bool = False,
-    field1_title: str = None, field1_value: str = None,
-    field2_title: str = None, field2_value: str = None,
-    field3_title: str = None, field3_value: str = None,
-    field4_title: str = None, field4_value: str = None,
-    field5_title: str = None, field5_value: str = None
 ):
     if not await has_admin_role(interaction):
         return await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
@@ -98,21 +87,11 @@ async def announce(
     quips = load_quips()
     quip_text = f"\n\n{random.choice(quips)}" if quips else ""
 
-    if add_update_prefix and title:
+    if add_update_prefix:
         title = f"Update: {title}"
 
     embed_color = EMBED_COLORS.get(color, discord.Color.green())
-    embed = discord.Embed(title=title if title else discord.Embed.Empty, description=desc, color=embed_color)
-
-    for i, (f_title, f_value) in enumerate([
-        (field1_title, field1_value),
-        (field2_title, field2_value),
-        (field3_title, field3_value),
-        (field4_title, field4_value),
-        (field5_title, field5_value)
-    ], start=1):
-        if f_title and f_value:
-            embed.add_field(name=f_title, value=f_value, inline=False)
+    embed = discord.Embed(title=title, description=desc, color=embed_color)
 
     if quip_text:
         embed.add_field(name="Quip", value=quip_text.strip(), inline=False)
@@ -129,7 +108,6 @@ async def announce(
     await channel.send(embed=embed)
     await interaction.response.send_message(f"📢 Sent to {channel.mention}", ephemeral=True)
 
-
 @bot.tree.command(name="announce_quip", description="Add a quip to the collection")
 async def announce_quip(interaction: discord.Interaction, quip: str):
     if not await has_admin_role(interaction):
@@ -138,26 +116,24 @@ async def announce_quip(interaction: discord.Interaction, quip: str):
     quips = load_quips()
     quips.append(quip)
     save_quips(quips)
-    await interaction.response.send_message(f"💬 Quip added: {quip}", ephemeral=True)
+    await interaction.response.send_message(f"💬 Quip added.", ephemeral=True)
 
-# --- CRITICAL ROLL DETECTION ---
+# --------------------------------------------------
+# AVRAE CRITICAL DETECTION (UNCHANGED LOGIC)
+# --------------------------------------------------
+
 @bot.event
 async def on_message(message):
-    await bot.process_commands(message)  # ensure slash commands still work
+    await bot.process_commands(message)
 
     if message.author.id != AVRAE_USER_ID:
         return
-    print(f"Author ID: {message.author.id} | Expected: {AVRAE_USER_ID}")
-    print(f"Embeds: {message.embeds}")
-
-
-    print(f"👀 Received Avrae message {message.id} from {message.author.name}")
-    found_nat20 = False
-    found_nat1 = False
 
     if not message.embeds:
-        print("⚠️ No embeds found.")
         return
+
+    found_nat20 = False
+    found_nat1 = False
 
     for embed in message.embeds:
         text_blocks = []
@@ -167,7 +143,6 @@ async def on_message(message):
             text_blocks.append(field.value)
 
         for text in text_blocks:
-            print(f"🔍 Scanning text: {text}")
             if nat20_pattern.search(text) or emoji_success_pattern.search(text):
                 found_nat20 = True
             if nat1_pattern.search(text) or emoji_fail_pattern.search(text):
@@ -179,11 +154,7 @@ async def on_message(message):
             await message.add_reaction(CRIT_FAIL_EMOJI)
 
         if found_nat20 or found_nat1:
-            msg_type = (
-                "both" if found_nat20 and found_nat1 else
-                "success" if found_nat20 else
-                "fail"
-            )
+            msg_type = "both" if found_nat20 and found_nat1 else "success" if found_nat20 else "fail"
             await forward_embed(message, embed, msg_type)
             return
 
@@ -205,16 +176,9 @@ async def on_raw_reaction_add(payload):
         return
 
     guild = channel.guild
-    try:
-        member = await guild.fetch_member(payload.user_id)
-    except discord.NotFound:
-        return
-
-    if member.bot:
-        return
+    member = await guild.fetch_member(payload.user_id)
 
     if TRUSTED_ROLE_ID not in [role.id for role in member.roles]:
-        print(f"🚫 User {member.name} lacks trusted role")
         return
 
     emoji = payload.emoji
@@ -225,19 +189,14 @@ async def on_raw_reaction_add(payload):
     else:
         return
 
-    print(f"✅ Trusted reaction by {member.name}: {emoji}")
-
-    for key, label in [('success', 'success'), ('fail', 'fail')]:
-        if len(reaction_tracker[message.id][key]) >= 1:
-            embed = message.embeds[0] if message.embeds else None
-            await forward_embed(message, embed, label)
+    for key in ['success', 'fail']:
+        if reaction_tracker[message.id][key]:
+            await forward_embed(message, message.embeds[0], key)
             reaction_tracker[message.id][key].clear()
 
-# --- FORWARD EMBED ---
 async def forward_embed(original_message, embed, message_type):
     channel = bot.get_channel(FORWARD_CHANNEL_ID)
     if not channel:
-        print("🚫 Forward channel not found.")
         return
 
     msg_text = {
@@ -246,16 +205,64 @@ async def forward_embed(original_message, embed, message_type):
         "both": f"{CRIT_SUCCESS_EMOJI} {CRIT_FAIL_EMOJI} **Critical success and failure detected!**"
     }.get(message_type, "**Roll detected!**")
 
-    await channel.send(f"{msg_text}\n[Jump to message]({original_message.jump_url})", embed=embed)
+    await channel.send(
+        f"{msg_text}\n[Jump to message]({original_message.jump_url})",
+        embed=embed
+    )
 
-# --- BOT READY ---
+# --------------------------------------------------
+# GITHUB WEBHOOK (NEW)
+# --------------------------------------------------
+
+async def github_webhook(request):
+    event = request.headers.get("X-GitHub-Event")
+    payload = await request.json()
+
+    channel = bot.get_channel(GITHUB_CHANNEL_ID)
+    role_ping = f"<@&{GITHUB_ROLE_ID}>" if GITHUB_ROLE_ID else ""
+
+    if not channel:
+        return web.Response(text="Channel not found")
+
+    if event == "push":
+        commits = "\n".join(f"- {c['message']}" for c in payload.get("commits", []))
+        repo = payload["repository"]["full_name"]
+
+        await channel.send(
+            f"{role_ping}\n📦 **Push to `{repo}`**\n{commits}"
+        )
+
+    elif event == "pull_request":
+        pr = payload["pull_request"]
+        await channel.send(
+            f"{role_ping}\n🔀 **PR {payload['action'].upper()}**\n"
+            f"**{pr['title']}**\n{pr['body'] or ''}"
+        )
+
+    return web.Response(text="OK")
+
+async def start_webhook():
+    app = web.Application()
+    app.router.add_post("/github", github_webhook)
+
+    runner = web.AppRunner(app)
+    await runner.setup()
+
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+
+# --------------------------------------------------
+# BOT READY
+# --------------------------------------------------
+
 @bot.event
 async def on_ready():
     await bot.tree.sync()
-    print(f"✅ Logged in as {bot.user} — Slash commands synced!")
+    await start_webhook()
+    print(f"✅ Logged in as {bot.user} | GitHub webhook active")
 
 # --- RUN ---
 if TOKEN:
     bot.run(TOKEN)
 else:
-    print("❌ DISCORD_TOKEN missing in .env")
+    print("❌ DISCORD_TOKEN missing")
