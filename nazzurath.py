@@ -248,6 +248,39 @@ async def forward_embed(original_message, embed, message_type):
 
     await channel.send(f"{msg_text}\n[Jump to message]({original_message.jump_url})", embed=embed)
 
+import json
+import asyncio
+
+ROLE_ID = 1459003739544490190  # replace with your role ID
+CHANNEL_ID = 1458991095856758855
+
+async def watch_github(bot):
+    last_seen = None
+    await bot.wait_until_ready()
+
+    while not bot.is_closed():
+        try:
+            with open("latest_push.json") as f:
+                data = json.load(f)
+
+            if data != last_seen:
+                channel = bot.get_channel(CHANNEL_ID)
+                role = channel.guild.get_role(ROLE_ID)
+
+                msg = (
+                    f"{role.mention}\n"
+                    f"**{data['repo']}** updated by **{data['pusher']}**\n"
+                    + "\n".join(data["messages"])
+                )
+
+                await channel.send(msg)
+                last_seen = data
+        except:
+            pass
+
+        await asyncio.sleep(10)
+
+
 # --- BOT READY ---
 @bot.event
 async def on_ready():
