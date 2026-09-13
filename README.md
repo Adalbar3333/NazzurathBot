@@ -113,11 +113,9 @@ First commit and push this finished project to the `main` branch of
 1. Sign in to the [Render Dashboard](https://dashboard.render.com/) with GitHub.
 2. Choose **New > Blueprint** and connect `Adalbar3333/NazzurathBot`.
 3. Render will read `render.yaml`. Confirm the **Free** service.
-4. Supply these secret values when prompted:
+4. Supply these two secret values when prompted:
    - `DISCORD_TOKEN`: the token from the Discord Developer Portal.
    - `GITHUB_TOKEN`: the read-only fine-grained GitHub token from step 2.
-   - `HOMEBREW_SIGNING_SECRET`: optional; leave blank unless you deliberately
-     want to share the website's `NEXTAUTH_SECRET` with the bot.
 5. Click **Apply**. The deploy is ready when the logs show `Logged in as ...`
    and the service's `/health` page shows `"discordReady": true`.
 

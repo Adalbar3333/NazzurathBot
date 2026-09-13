@@ -10,8 +10,6 @@ services:
         sync: false
       - key: GITHUB_TOKEN
         sync: false
-      - key: HOMEBREW_SIGNING_SECRET
-        sync: false
       - key: HOMEBREW_CHANNEL_ID
         value: "1548461625865015466"
       - key: GITHUB_OWNER
