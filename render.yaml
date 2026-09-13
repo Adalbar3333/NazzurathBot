@@ -1,0 +1,24 @@
+services:
+  - type: web
+    name: nazzurath-discord-bot
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    autoDeployTrigger: commit
+    envVars:
+      - key: DISCORD_TOKEN
+        sync: false
+      - key: GITHUB_TOKEN
+        sync: false
+      - key: HOMEBREW_SIGNING_SECRET
+        sync: false
+      - key: HOMEBREW_CHANNEL_ID
+        value: "1548461625865015466"
+      - key: GITHUB_OWNER
+        value: Adalbar3333
+      - key: GITHUB_REPO
+        value: Tazzurath-Website
+      - key: GITHUB_BRANCH
+        value: main
+      - key: WEBSITE_URL
+        value: https://www.tazzurath.com

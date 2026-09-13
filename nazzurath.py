@@ -1,268 +1,466 @@
-import discord
-from discord.ext import commands
-from discord import app_commands
-import re
+from __future__ import annotations
+
+import asyncio
 import json
+import logging
 import os
 import random
+import re
 from collections import defaultdict
-from dotenv import load_dotenv
+from datetime import datetime, time
+from pathlib import Path
+from typing import Optional
+from zoneinfo import ZoneInfo
+
+import discord
 from aiohttp import web
-import asyncio
+from discord import app_commands
+from discord.ext import commands, tasks
+from dotenv import load_dotenv
 
-# --- ENV + TOKEN ---
-load_dotenv()
-TOKEN = os.getenv("DISCORD_TOKEN")
+from github_service import GitHubError, GitHubService, Proposal
 
-# --- GITHUB CONFIG ---
-GITHUB_CHANNEL_ID = int(os.getenv("GITHUB_CHANNEL_ID", 0))
-GITHUB_ROLE_ID = int(os.getenv("GITHUB_ROLE_ID", 0))
-PORT = int(os.getenv("PORT", 8080))
 
-# --- CONFIG ---
-AVRAE_USER_ID = 261302296103747584
-FORWARD_CHANNEL_ID = 1360707370732486868
-TRUSTED_ROLE_ID = 998391075905474630
-ADMIN_ROLE_ID = 998390105217716296
-QUIP_FILE = 'quips.json'
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
+logging.basicConfig(
+    level=os.getenv("LOG_LEVEL", "INFO").upper(),
+    format="%(asctime)s %(levelname)s %(name)s: %(message)s",
+)
+log = logging.getLogger("nazzurath")
+
+
+def env_int(name: str, default: int) -> int:
+    value = os.getenv(name)
+    try:
+        return int(value) if value else default
+    except ValueError as exc:
+        raise RuntimeError(f"{name} must be a Discord numeric ID") from exc
+
+
+def env_bool(name: str, default: bool = False) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+TOKEN = os.getenv("DISCORD_TOKEN", "")
+HOMEBREW_CHANNEL_ID = env_int("HOMEBREW_CHANNEL_ID", 1548461625865015466)
+HOMEBREW_ROLE_ID = env_int("HOMEBREW_ROLE_ID", 0)
+PORT = env_int("PORT", 8080)
+
+AVRAE_USER_ID = env_int("AVRAE_USER_ID", 261302296103747584)
+FORWARD_CHANNEL_ID = env_int("FORWARD_CHANNEL_ID", 1360707370732486868)
+TRUSTED_ROLE_ID = env_int("TRUSTED_ROLE_ID", 998391075905474630)
+ADMIN_ROLE_ID = env_int("ADMIN_ROLE_ID", 998390105217716296)
+QUIP_FILE = Path(os.getenv("QUIP_FILE", str(BASE_DIR / "quips.json")))
+
+CENTRAL = ZoneInfo("America/Chicago")
+POLL_SECONDS = max(30, env_int("GITHUB_POLL_SECONDS", 60))
+ANNOUNCE_EXISTING_SUBMISSIONS = env_bool("ANNOUNCE_EXISTING_SUBMISSIONS")
 
 CRIT_SUCCESS_EMOJI = discord.PartialEmoji(name="criticalSuccess", id=1361065140031848479)
 CRIT_FAIL_EMOJI = discord.PartialEmoji(name="criticalFailure", id=1361065894339543284)
 
-nat20_pattern = re.compile(r'\(\**?20\**?\)')
-nat1_pattern = re.compile(r'\(\**?1\**?\)')
-emoji_success_pattern = re.compile(r':?criticalSuccess:?|<:criticalSuccess:\d+>')
-emoji_fail_pattern = re.compile(r':?criticalFailure:?|<:criticalFailure:\d+>')
+nat20_pattern = re.compile(r"\(\**?20\**?\)")
+nat1_pattern = re.compile(r"\(\**?1\**?\)")
+emoji_success_pattern = re.compile(r":?criticalSuccess:?|<:criticalSuccess:\d+>")
+emoji_fail_pattern = re.compile(r":?criticalFailure:?|<:criticalFailure:\d+>")
 
 EMBED_COLORS = {
-    'Warning': discord.Color.red(),
-    'Update': discord.Color.blue(),
-    'Announcement': discord.Color.green(),
-    'Ideas': discord.Color.purple(),
-    'Good News': discord.Color.gold(),
-    'Greetings': discord.Color.teal()
+    "Warning": discord.Color.red(),
+    "Update": discord.Color.blue(),
+    "Announcement": discord.Color.green(),
+    "Ideas": discord.Color.purple(),
+    "Good News": discord.Color.gold(),
+    "Greetings": discord.Color.teal(),
 }
 
-reaction_tracker = defaultdict(lambda: {'success': set(), 'fail': set()})
+reaction_tracker = defaultdict(lambda: {"success": set(), "fail": set()})
 
-# --- INTENTS + BOT ---
-intents = discord.Intents.all()
-bot = commands.Bot(command_prefix='!', intents=intents)
 
-# --- QUIPS ---
-def load_quips():
-    if os.path.exists(QUIP_FILE):
-        with open(QUIP_FILE, 'r') as f:
-            return json.load(f)
-    return []
+def load_quips() -> list[str]:
+    try:
+        with QUIP_FILE.open(encoding="utf-8") as file:
+            value = json.load(file)
+            return value if isinstance(value, list) else []
+    except (FileNotFoundError, json.JSONDecodeError, OSError):
+        return []
 
-def save_quips(quips):
-    with open(QUIP_FILE, 'w') as f:
-        json.dump(quips, f, indent=4)
 
-# --- ROLE CHECK ---
-async def has_admin_role(interaction: discord.Interaction):
-    return any(role.id == ADMIN_ROLE_ID for role in interaction.user.roles)
+def save_quips(quips: list[str]) -> None:
+    QUIP_FILE.write_text(json.dumps(quips, indent=2) + "\n", encoding="utf-8")
 
-# --------------------------------------------------
-# SLASH COMMANDS
-# --------------------------------------------------
+
+def shorten(value: str, length: int) -> str:
+    clean = re.sub(r"\s+", " ", value or "").strip()
+    return clean if len(clean) <= length else clean[: length - 1].rstrip() + "…"
+
+
+def chunk_lines(lines: list[str], limit: int = 3900) -> list[str]:
+    chunks: list[str] = []
+    current: list[str] = []
+    size = 0
+    for original in lines:
+        line = shorten(original, limit)
+        added = len(line) + (1 if current else 0)
+        if current and size + added > limit:
+            chunks.append("\n".join(current))
+            current = []
+            size = 0
+        current.append(line)
+        size += len(line) + (1 if size else 0)
+    if current:
+        chunks.append("\n".join(current))
+    return chunks
+
+
+class NazzurathBot(commands.Bot):
+    def __init__(self) -> None:
+        intents = discord.Intents.default()
+        intents.message_content = True
+        intents.members = True
+        intents.reactions = True
+        super().__init__(command_prefix="!", intents=intents)
+        self.github = GitHubService.from_env()
+        self.health_runner: web.AppRunner | None = None
+        self.report_lock = asyncio.Lock()
+        self.completed_vote_dates: set[str] = set()
+        self.completed_pages_dates: set[str] = set()
+        self.known_proposal_ids: set[int] | None = None
+
+    async def setup_hook(self) -> None:
+        await self.github.start()
+        await self.start_health_server()
+        homebrew_monitor.change_interval(seconds=POLL_SECONDS)
+        homebrew_monitor.start()
+        scheduled_reports.start()
+        await self.tree.sync()
+
+    async def close(self) -> None:
+        if homebrew_monitor.is_running():
+            homebrew_monitor.cancel()
+        if scheduled_reports.is_running():
+            scheduled_reports.cancel()
+        await self.github.close()
+        if self.health_runner:
+            await self.health_runner.cleanup()
+        await super().close()
+
+    async def start_health_server(self) -> None:
+        async def health(_: web.Request) -> web.Response:
+            return web.json_response({
+                "ok": True,
+                "discordReady": self.is_ready(),
+                "githubConfigured": self.github.configured,
+            })
+
+        app = web.Application()
+        app.router.add_get("/", health)
+        app.router.add_get("/health", health)
+        self.health_runner = web.AppRunner(app)
+        await self.health_runner.setup()
+        site = web.TCPSite(self.health_runner, "0.0.0.0", PORT)
+        await site.start()
+        log.info("Health server listening on port %s", PORT)
+
+    async def homebrew_channel(self) -> discord.TextChannel:
+        channel = self.get_channel(HOMEBREW_CHANNEL_ID)
+        if channel is None:
+            channel = await self.fetch_channel(HOMEBREW_CHANNEL_ID)
+        if not isinstance(channel, discord.TextChannel):
+            raise RuntimeError(f"HOMEBREW_CHANNEL_ID {HOMEBREW_CHANNEL_ID} is not a text channel")
+        return channel
+
+
+bot = NazzurathBot()
+
+
+async def has_admin_role(interaction: discord.Interaction) -> bool:
+    return isinstance(interaction.user, discord.Member) and any(
+        role.id == ADMIN_ROLE_ID for role in interaction.user.roles
+    )
+
 
 @bot.tree.command(name="announce", description="Announce a message in a channel")
+@app_commands.describe(desc="The announcement text", add_update_prefix="Prefix the title with Update")
 async def announce(
     interaction: discord.Interaction,
     channel: discord.TextChannel,
     title: str,
     desc: str,
-    color: str = 'Announcement',
+    color: str = "Announcement",
     add_update_prefix: bool = False,
-    image: str = None,
-    thumbnail: str = None,
-    footer: str = None,
+    image: Optional[str] = None,
+    thumbnail: Optional[str] = None,
+    footer: Optional[str] = None,
     timestamp: bool = False,
-):
+) -> None:
     if not await has_admin_role(interaction):
-        return await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
 
     quips = load_quips()
-    quip_text = f"\n\n{random.choice(quips)}" if quips else ""
-
     if add_update_prefix:
         title = f"Update: {title}"
-
-    embed_color = EMBED_COLORS.get(color, discord.Color.green())
-    embed = discord.Embed(title=title, description=desc, color=embed_color)
-
-    if quip_text:
-        embed.add_field(name="Quip", value=quip_text.strip(), inline=False)
-
+    embed = discord.Embed(
+        title=shorten(title, 256),
+        description=shorten(desc, 4096),
+        color=EMBED_COLORS.get(color, discord.Color.green()),
+    )
+    if quips:
+        embed.add_field(name="Quip", value=shorten(random.choice(quips), 1024), inline=False)
     if image:
         embed.set_image(url=image)
     if thumbnail:
         embed.set_thumbnail(url=thumbnail)
     if footer:
-        embed.set_footer(text=footer)
+        embed.set_footer(text=shorten(footer, 2048))
     if timestamp:
         embed.timestamp = discord.utils.utcnow()
 
     await channel.send(embed=embed)
     await interaction.response.send_message(f"📢 Sent to {channel.mention}", ephemeral=True)
 
-@bot.tree.command(name="announce_quip", description="Add a quip to the collection")
-async def announce_quip(interaction: discord.Interaction, quip: str):
-    if not await has_admin_role(interaction):
-        return await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
 
+@bot.tree.command(name="announce_quip", description="Add a quip to the collection")
+async def announce_quip(interaction: discord.Interaction, quip: str) -> None:
+    if not await has_admin_role(interaction):
+        await interaction.response.send_message("❌ You do not have permission.", ephemeral=True)
+        return
     quips = load_quips()
     quips.append(quip)
     save_quips(quips)
-    await interaction.response.send_message(f"💬 Quip added.", ephemeral=True)
+    await interaction.response.send_message("💬 Quip added.", ephemeral=True)
 
-# --------------------------------------------------
-# AVRAE CRITICAL DETECTION (UNCHANGED LOGIC)
-# --------------------------------------------------
 
 @bot.event
-async def on_message(message):
+async def on_message(message: discord.Message) -> None:
     await bot.process_commands(message)
-
-    if message.author.id != AVRAE_USER_ID:
+    if message.author.id != AVRAE_USER_ID or not message.embeds:
         return
-
-    if not message.embeds:
-        return
-
-    found_nat20 = False
-    found_nat1 = False
 
     for embed in message.embeds:
-        text_blocks = []
-        if embed.description:
-            text_blocks.append(embed.description)
-        for field in embed.fields:
-            text_blocks.append(field.value)
-
-        for text in text_blocks:
-            if nat20_pattern.search(text) or emoji_success_pattern.search(text):
-                found_nat20 = True
-            if nat1_pattern.search(text) or emoji_fail_pattern.search(text):
-                found_nat1 = True
+        text_blocks = [embed.description] if embed.description else []
+        text_blocks.extend(field.value for field in embed.fields)
+        found_nat20 = any(nat20_pattern.search(text) or emoji_success_pattern.search(text) for text in text_blocks)
+        found_nat1 = any(nat1_pattern.search(text) or emoji_fail_pattern.search(text) for text in text_blocks)
 
         if found_nat20:
             await message.add_reaction(CRIT_SUCCESS_EMOJI)
         if found_nat1:
             await message.add_reaction(CRIT_FAIL_EMOJI)
-
         if found_nat20 or found_nat1:
-            msg_type = "both" if found_nat20 and found_nat1 else "success" if found_nat20 else "fail"
-            await forward_embed(message, embed, msg_type)
+            message_type = "both" if found_nat20 and found_nat1 else "success" if found_nat20 else "fail"
+            await forward_embed(message, embed, message_type)
             return
 
+
 @bot.event
-async def on_raw_reaction_add(payload):
-    if payload.user_id == bot.user.id:
+async def on_raw_reaction_add(payload: discord.RawReactionActionEvent) -> None:
+    if bot.user is None or payload.user_id == bot.user.id or payload.guild_id is None:
         return
-
     channel = bot.get_channel(payload.channel_id)
-    if not channel:
+    if not isinstance(channel, discord.TextChannel):
         return
-
     try:
         message = await channel.fetch_message(payload.message_id)
-    except discord.NotFound:
+    except (discord.NotFound, discord.Forbidden):
         return
-
-    if message.author.id != AVRAE_USER_ID:
+    if message.author.id != AVRAE_USER_ID or not message.embeds:
         return
 
     guild = channel.guild
-    member = await guild.fetch_member(payload.user_id)
-
+    try:
+        member = payload.member or guild.get_member(payload.user_id) or await guild.fetch_member(payload.user_id)
+    except discord.NotFound:
+        return
     if TRUSTED_ROLE_ID not in [role.id for role in member.roles]:
         return
 
-    emoji = payload.emoji
-    if emoji == CRIT_SUCCESS_EMOJI:
-        reaction_tracker[message.id]['success'].add(member.id)
-    elif emoji == CRIT_FAIL_EMOJI:
-        reaction_tracker[message.id]['fail'].add(member.id)
+    if payload.emoji == CRIT_SUCCESS_EMOJI:
+        reaction_tracker[message.id]["success"].add(member.id)
+        key = "success"
+    elif payload.emoji == CRIT_FAIL_EMOJI:
+        reaction_tracker[message.id]["fail"].add(member.id)
+        key = "fail"
     else:
         return
 
-    for key in ['success', 'fail']:
-        if reaction_tracker[message.id][key]:
-            await forward_embed(message, message.embeds[0], key)
-            reaction_tracker[message.id][key].clear()
+    if reaction_tracker[message.id][key]:
+        await forward_embed(message, message.embeds[0], key)
+        reaction_tracker[message.id][key].clear()
 
-async def forward_embed(original_message, embed, message_type):
+
+async def forward_embed(original_message: discord.Message, embed: discord.Embed, message_type: str) -> None:
     channel = bot.get_channel(FORWARD_CHANNEL_ID)
-    if not channel:
+    if not isinstance(channel, discord.TextChannel):
         return
-
-    msg_text = {
+    message_text = {
         "success": f"{CRIT_SUCCESS_EMOJI} **Critical success detected!**",
         "fail": f"{CRIT_FAIL_EMOJI} **Critical failure detected!**",
-        "both": f"{CRIT_SUCCESS_EMOJI} {CRIT_FAIL_EMOJI} **Critical success and failure detected!**"
+        "both": f"{CRIT_SUCCESS_EMOJI} {CRIT_FAIL_EMOJI} **Critical success and failure detected!**",
     }.get(message_type, "**Roll detected!**")
+    await channel.send(f"{message_text}\n[Jump to message]({original_message.jump_url})", embed=embed)
 
+
+async def announced_issue_numbers(channel: discord.TextChannel, after: datetime | None = None) -> set[int]:
+    numbers: set[int] = set()
+    async for message in channel.history(limit=None if after else 200, after=after):
+        for embed in message.embeds:
+            footer = embed.footer.text or ""
+            match = re.fullmatch(r"NazzurathBot:homebrew:(\d+)", footer)
+            if match:
+                numbers.add(int(match.group(1)))
+    return numbers
+
+
+async def report_marker_exists(channel: discord.TextChannel, marker: str, after: datetime) -> bool:
+    async for message in channel.history(limit=100, after=after):
+        if any(embed.footer.text == marker for embed in message.embeds):
+            return True
+    return False
+
+
+async def announce_proposal(channel: discord.TextChannel, proposal: Proposal) -> None:
+    description = shorten(proposal.body, 1000) or "No description provided."
+    embed = discord.Embed(
+        title=shorten(proposal.title, 256),
+        url=bot.github.registry_url,
+        description=description,
+        color=discord.Color.from_rgb(146, 113, 63),
+        timestamp=proposal.created_at,
+    )
+    embed.set_author(name="New Tazzurath homebrew submission")
+    embed.add_field(name="Submitted by", value=shorten(proposal.author, 1024), inline=True)
+    embed.add_field(name="Destination", value=shorten(proposal.destination, 1024), inline=True)
+    if proposal.source_url:
+        embed.add_field(name="Submitted source", value=f"[Open source material]({proposal.source_url})", inline=False)
+    embed.add_field(
+        name="Vote",
+        value=f"[Open the homebrew registry]({bot.github.registry_url}) to review and vote.",
+        inline=False,
+    )
+    embed.set_footer(text=f"NazzurathBot:homebrew:{proposal.number}")
+    role_ping = f"<@&{HOMEBREW_ROLE_ID}>" if HOMEBREW_ROLE_ID else None
     await channel.send(
-        f"{msg_text}\n[Jump to message]({original_message.jump_url})",
-        embed=embed
+        content=role_ping,
+        embed=embed,
+        allowed_mentions=discord.AllowedMentions(everyone=False, users=False, roles=True),
     )
 
-# --------------------------------------------------
-# GITHUB WEBHOOK (NEW)
-# --------------------------------------------------
 
-async def github_webhook(request):
-    event = request.headers.get("X-GitHub-Event")
-    payload = await request.json()
+async def send_vote_report(channel: discord.TextChannel, now: datetime) -> None:
+    marker = f"NazzurathBot:vote-report:{now.date().isoformat()}"
+    midnight = datetime.combine(now.date(), time.min, tzinfo=CENTRAL)
+    if await report_marker_exists(channel, marker, midnight):
+        return
+    proposals = await bot.github.list_proposals(include_comments=True)
+    voteable = [proposal for proposal in proposals if proposal.status not in {"approved", "disapproved"}]
+    if not voteable:
+        log.info("No voteable proposals; no 6 AM message sent")
+        return
 
-    channel = bot.get_channel(GITHUB_CHANNEL_ID)
-    role_ping = f"<@&{GITHUB_ROLE_ID}>" if GITHUB_ROLE_ID else ""
-
-    if not channel:
-        return web.Response(text="Channel not found")
-
-    if event == "push":
-        commits = "\n".join(f"- {c['message']}" for c in payload.get("commits", []))
-        repo = payload["repository"]["full_name"]
-
-        await channel.send(
-            f"{role_ping}\n📦 **Push to `{repo}`**\n{commits}"
+    lines = [
+        f"• [#{item.number} — {discord.utils.escape_markdown(shorten(item.title, 110))}]({bot.github.registry_url}) "
+        f"— {item.status_label}; **{item.approve}** approve / **{item.disapprove}** disapprove"
+        for item in voteable
+    ]
+    for index, description in enumerate(chunk_lines(lines)):
+        embed = discord.Embed(
+            title="Current homebrew submissions to vote on" if index == 0 else "Homebrew submissions (continued)",
+            description=description,
+            url=bot.github.registry_url,
+            color=discord.Color.gold(),
+            timestamp=now,
         )
+        embed.set_footer(text=marker)
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
-    elif event == "pull_request":
-        pr = payload["pull_request"]
-        await channel.send(
-            f"{role_ping}\n🔀 **PR {payload['action'].upper()}**\n"
-            f"**{pr['title']}**\n{pr['body'] or ''}"
+
+async def send_pages_report(channel: discord.TextChannel, now: datetime) -> None:
+    marker = f"NazzurathBot:pages-report:{now.date().isoformat()}"
+    midnight = datetime.combine(now.date(), time.min, tzinfo=CENTRAL)
+    if await report_marker_exists(channel, marker, midnight):
+        return
+    pages = await bot.github.new_pages_between(midnight, now)
+    if not pages:
+        log.info("No new pages; no noon message sent")
+        return
+
+    lines = [f"• [{discord.utils.escape_markdown(shorten(page.title, 120))}]({page.url})" for page in pages]
+    for index, description in enumerate(chunk_lines(lines)):
+        embed = discord.Embed(
+            title=f"New Tazzurath pages today ({len(pages)})" if index == 0 else "New pages (continued)",
+            description=description,
+            color=discord.Color.blue(),
+            timestamp=now,
         )
+        embed.set_footer(text=marker)
+        await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
 
-    return web.Response(text="OK")
 
-async def start_webhook():
-    app = web.Application()
-    app.router.add_post("/github", github_webhook)
+@tasks.loop(seconds=60)
+async def homebrew_monitor() -> None:
+    if not bot.github.configured:
+        return
+    try:
+        channel = await bot.homebrew_channel()
+        proposals = await bot.github.list_proposals(include_comments=False)
+        if bot.known_proposal_ids is None:
+            earliest = min((proposal.created_at for proposal in proposals), default=None)
+            bot.known_proposal_ids = await announced_issue_numbers(channel, after=earliest)
+            if not bot.known_proposal_ids and not ANNOUNCE_EXISTING_SUBMISSIONS:
+                bot.known_proposal_ids.update(proposal.number for proposal in proposals)
+                log.info("Recorded %s existing proposals without announcing them", len(proposals))
+                return
+        for proposal in sorted(proposals, key=lambda item: item.number):
+            if proposal.number not in bot.known_proposal_ids:
+                await announce_proposal(channel, proposal)
+                bot.known_proposal_ids.add(proposal.number)
+    except (GitHubError, discord.DiscordException, RuntimeError) as exc:
+        log.error("Homebrew monitor failed: %s", exc)
 
-    runner = web.AppRunner(app)
-    await runner.setup()
 
-    site = web.TCPSite(runner, "0.0.0.0", PORT)
-    await site.start()
+@homebrew_monitor.before_loop
+async def before_homebrew_monitor() -> None:
+    await bot.wait_until_ready()
 
-# --------------------------------------------------
-# BOT READY
-# --------------------------------------------------
+
+@tasks.loop(seconds=60)
+async def scheduled_reports() -> None:
+    if not bot.github.configured or bot.report_lock.locked():
+        return
+    now = datetime.now(CENTRAL)
+    date_key = now.date().isoformat()
+    try:
+        async with bot.report_lock:
+            channel = await bot.homebrew_channel()
+            if now.hour >= 6 and date_key not in bot.completed_vote_dates:
+                await send_vote_report(channel, now)
+                bot.completed_vote_dates.add(date_key)
+            if now.hour >= 12 and date_key not in bot.completed_pages_dates:
+                await send_pages_report(channel, now)
+                bot.completed_pages_dates.add(date_key)
+    except (GitHubError, discord.DiscordException, RuntimeError) as exc:
+        log.error("Scheduled report failed: %s", exc)
+
+
+@scheduled_reports.before_loop
+async def before_scheduled_reports() -> None:
+    await bot.wait_until_ready()
+
 
 @bot.event
-async def on_ready():
-    await bot.tree.sync()
-    await start_webhook()
-    print(f"✅ Logged in as {bot.user} | GitHub webhook active")
+async def on_ready() -> None:
+    log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
+    if not bot.github.configured:
+        log.warning("GitHub integration is disabled: set GITHUB_TOKEN")
 
-# --- RUN ---
-if TOKEN:
-    bot.run(TOKEN)
-else:
-    print("❌ DISCORD_TOKEN missing")
+
+if __name__ == "__main__":
+    if not TOKEN:
+        raise SystemExit("DISCORD_TOKEN is missing. Copy .env.example to .env and add the token.")
+    bot.run(TOKEN, log_handler=None)
