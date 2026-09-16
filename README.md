@@ -1,8 +1,8 @@
 # Nazzurath Discord Bot
 
 Nazzurath is a Discord bot for the Tazzurath server and website. It keeps the
-existing announcement and Avrae critical-roll features and adds a read-only
-GitHub integration for the website's homebrew registry.
+existing announcement, Avrae critical-roll, and read-only GitHub homebrew
+features, and connects the website's DM scheduling system to Discord.
 
 ## What it does
 
@@ -22,10 +22,20 @@ GitHub integration for the website's homebrew registry.
   daily reports after a restart.
 - Keeps `/announce`, `/announce_quip`, automatic Avrae critical detection, and
   trusted-role reaction forwarding.
+- Synchronizes current Discord members, display names, avatars, and roles to the
+  website's PostgreSQL database every ten minutes. Members who leave are marked
+  inactive instead of being deleted.
+- Delivers durable scheduling invitations, session changes, cancellations, and
+  24-hour/1-hour reminders by DM. Invitation and session messages have
+  persistent response buttons that still work after a bot restart.
+- Records Accept/Decline and Attending/Decline responses in the shared database
+  and notifies the group's managers. A failed private message remains visible on
+  the website and creates a manager-facing delivery warning.
 - Exposes `/health` on `PORT` for host health checks.
 
-The bot only needs read access to the website repository. No website code or
-GitHub webhook is required.
+The GitHub integration only needs read access to the website repository. The
+scheduling integration uses the same Supabase PostgreSQL database as the
+website; database credentials stay server-side.
 
 ## 1. Create/configure the Discord app
 
@@ -78,6 +88,9 @@ Open `.env` and supply at least:
 ```dotenv
 DISCORD_TOKEN=the_discord_bot_token
 GITHUB_TOKEN=the_read_only_fine_grained_github_token
+DATABASE_URL=the_supabase_pooled_postgresql_connection_string
+DISCORD_GUILD_ID=the_tazzurath_server_id
+DISCORD_DM_ROLE_ID=the_global_dm_role_id
 ```
 
 The channel and repository values are already set to the requested defaults.
@@ -85,6 +98,12 @@ The channel and repository values are already set to the requested defaults.
 Advanced deployments can give it the website's `NEXTAUTH_SECRET` to verify the
 site's signed metadata, but this is not required and does place that sensitive
 website secret on a second server.
+
+`DATABASE_URL` is optional at process level: when it is absent, scheduling is
+disabled and every existing bot feature continues to run. To use scheduling,
+first apply the migrations from the Tazzurath website repository, then use a
+least-privilege runtime database credential. `WEBSITE_URL` controls links in
+Discord messages. `SCHEDULING_POLL_SECONDS` defaults to 15 seconds.
 
 Then verify and start it:
 
@@ -113,9 +132,13 @@ First commit and push this finished project to the `main` branch of
 1. Sign in to the [Render Dashboard](https://dashboard.render.com/) with GitHub.
 2. Choose **New > Blueprint** and connect `Adalbar3333/NazzurathBot`.
 3. Render will read `render.yaml`. Confirm the **Free** service.
-4. Supply these two secret values when prompted:
+4. Supply these secret values when prompted:
    - `DISCORD_TOKEN`: the token from the Discord Developer Portal.
    - `GITHUB_TOKEN`: the read-only fine-grained GitHub token from step 2.
+   - `DATABASE_URL`: the pooled Supabase PostgreSQL connection string used by
+     the scheduling website.
+   - `DISCORD_GUILD_ID`: the Tazzurath server ID.
+   - `DISCORD_DM_ROLE_ID`: the global Dungeon Master role ID.
 5. Click **Apply**. The deploy is ready when the logs show `Logged in as ...`
    and the service's `/health` page shows `"discordReady": true`.
 
@@ -129,8 +152,9 @@ at [UptimeRobot](https://uptimerobot.com/):
 3. Paste the `/health` URL and use the free 5-minute interval.
 
 That interval is shorter than Render's 15-minute idle window. The bot does not
-need a database or persistent disk: restart deduplication is stored as hidden
-markers on its Discord messages, and all website state remains in GitHub.
+need a persistent disk. Homebrew restart deduplication uses hidden Discord
+message markers, while scheduling delivery and button state are durable in
+PostgreSQL.
 
 Render's free tier is suitable for a hobby bot but does not provide a production
 uptime guarantee and can restart services. The bot reconnects automatically and
@@ -157,3 +181,11 @@ small, low-CPU bot.
   `content/**/*.md` files count, not edits to existing pages.
 - **No 6 AM message:** this is expected when every proposal is already approved
   or disapproved.
+- **Scheduling is disabled:** set `DATABASE_URL` and `DISCORD_GUILD_ID`; the
+  `/health` response reports configuration, database health, worker state, and
+  last successful worker timestamps without exposing schedule data.
+- **Member list is empty:** enable **Server Members Intent**, verify
+  `DISCORD_GUILD_ID`, and restart the bot.
+- **Scheduling DMs fail:** members must share the server and allow private
+  messages from server members. The website alert is retained and group
+  managers receive a delivery warning.

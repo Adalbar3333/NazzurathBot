@@ -10,6 +10,12 @@ services:
         sync: false
       - key: GITHUB_TOKEN
         sync: false
+      - key: DATABASE_URL
+        sync: false
+      - key: DISCORD_GUILD_ID
+        sync: false
+      - key: DISCORD_DM_ROLE_ID
+        sync: false
       - key: HOMEBREW_CHANNEL_ID
         value: "1548461625865015466"
       - key: GITHUB_OWNER
@@ -20,3 +26,5 @@ services:
         value: main
       - key: WEBSITE_URL
         value: https://www.tazzurath.com
+      - key: SCHEDULING_POLL_SECONDS
+        value: "15"

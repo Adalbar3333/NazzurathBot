@@ -19,7 +19,13 @@ from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
 from github_service import GitHubError, GitHubService, Proposal
-
+from scheduling_service import (
+    MAX_NOTIFICATION_ATTEMPTS,
+    GuildMemberRecord,
+    SchedulingNotification,
+    SchedulingService,
+    render_notification,
+)
 
 BASE_DIR = Path(__file__).resolve().parent
 load_dotenv(BASE_DIR / ".env")
@@ -55,11 +61,14 @@ AVRAE_USER_ID = env_int("AVRAE_USER_ID", 261302296103747584)
 FORWARD_CHANNEL_ID = env_int("FORWARD_CHANNEL_ID", 1360707370732486868)
 TRUSTED_ROLE_ID = env_int("TRUSTED_ROLE_ID", 998391075905474630)
 ADMIN_ROLE_ID = env_int("ADMIN_ROLE_ID", 998390105217716296)
+DISCORD_GUILD_ID = env_int("DISCORD_GUILD_ID", 0)
+DISCORD_DM_ROLE_ID = env_int("DISCORD_DM_ROLE_ID", 0)
 QUIP_FILE = Path(os.getenv("QUIP_FILE", str(BASE_DIR / "quips.json")))
 
 CENTRAL = ZoneInfo("America/Chicago")
 POLL_SECONDS = max(30, env_int("GITHUB_POLL_SECONDS", 60))
 ANNOUNCE_EXISTING_SUBMISSIONS = env_bool("ANNOUNCE_EXISTING_SUBMISSIONS")
+NOTIFICATION_POLL_SECONDS = max(5, env_int("SCHEDULING_POLL_SECONDS", 15))
 
 CRIT_SUCCESS_EMOJI = discord.PartialEmoji(name="criticalSuccess", id=1361065140031848479)
 CRIT_FAIL_EMOJI = discord.PartialEmoji(name="criticalFailure", id=1361065894339543284)
@@ -125,6 +134,7 @@ class NazzurathBot(commands.Bot):
         intents.reactions = True
         super().__init__(command_prefix="!", intents=intents)
         self.github = GitHubService.from_env()
+        self.scheduling = SchedulingService.from_env()
         self.health_runner: web.AppRunner | None = None
         self.report_lock = asyncio.Lock()
         self.completed_vote_dates: set[str] = set()
@@ -133,10 +143,16 @@ class NazzurathBot(commands.Bot):
 
     async def setup_hook(self) -> None:
         await self.github.start()
+        await self.scheduling.start()
+        self.add_view(InvitationResponseView(self))
+        self.add_view(SessionResponseView(self))
         await self.start_health_server()
         homebrew_monitor.change_interval(seconds=POLL_SECONDS)
         homebrew_monitor.start()
         scheduled_reports.start()
+        scheduling_notification_worker.change_interval(seconds=NOTIFICATION_POLL_SECONDS)
+        scheduling_notification_worker.start()
+        scheduling_member_sync.start()
         await self.tree.sync()
 
     async def close(self) -> None:
@@ -144,7 +160,12 @@ class NazzurathBot(commands.Bot):
             homebrew_monitor.cancel()
         if scheduled_reports.is_running():
             scheduled_reports.cancel()
+        if scheduling_notification_worker.is_running():
+            scheduling_notification_worker.cancel()
+        if scheduling_member_sync.is_running():
+            scheduling_member_sync.cancel()
         await self.github.close()
+        await self.scheduling.close()
         if self.health_runner:
             await self.health_runner.cleanup()
         await super().close()
@@ -155,6 +176,23 @@ class NazzurathBot(commands.Bot):
                 "ok": True,
                 "discordReady": self.is_ready(),
                 "githubConfigured": self.github.configured,
+                "scheduling": {
+                    "configured": self.scheduling.configured,
+                    "databaseHealthy": self.scheduling.database_healthy,
+                    "guildConfigured": bool(DISCORD_GUILD_ID),
+                    "dmRoleConfigured": bool(DISCORD_DM_ROLE_ID),
+                    "notificationWorkerRunning": scheduling_notification_worker.is_running(),
+                    "memberSyncWorkerRunning": scheduling_member_sync.is_running(),
+                    "lastNotificationRun": (
+                        self.scheduling.last_notification_run_at.isoformat()
+                        if self.scheduling.last_notification_run_at else None
+                    ),
+                    "lastMemberSync": (
+                        self.scheduling.last_member_sync_at.isoformat()
+                        if self.scheduling.last_member_sync_at else None
+                    ),
+                    "lastErrorType": self.scheduling.last_error,
+                },
             })
 
         app = web.Application()
@@ -176,6 +214,150 @@ class NazzurathBot(commands.Bot):
 
 
 bot = NazzurathBot()
+
+
+async def handle_scheduling_response(
+    interaction: discord.Interaction,
+    response_kind: str,
+    response: str,
+) -> None:
+    if interaction.message is None:
+        await interaction.response.send_message("This scheduling message is no longer available.", ephemeral=True)
+        return
+    try:
+        outcome = await bot.scheduling.respond_to_message(
+            discord_message_id=str(interaction.message.id),
+            actor_discord_id=str(interaction.user.id),
+            response_kind=response_kind,
+            response=response,
+        )
+    except Exception as exc:
+        log.error(
+            "Scheduling response failed for message=%s user=%s: %s",
+            interaction.message.id,
+            interaction.user.id,
+            type(exc).__name__,
+        )
+        await interaction.response.send_message(
+            "I could not save that response. Please try again or use the scheduling website.",
+            ephemeral=True,
+        )
+        return
+
+    await interaction.response.send_message(outcome.message, ephemeral=True)
+    if outcome.ok and outcome.status:
+        disabled_view: discord.ui.View
+        if response_kind == "invitation":
+            disabled_view = InvitationResponseView(bot, disabled=True)
+        else:
+            message_url = next(
+                (embed.url for embed in interaction.message.embeds if embed.url),
+                None,
+            )
+            disabled_view = SessionResponseView(bot, disabled=True, url=message_url)
+        try:
+            await interaction.message.edit(view=disabled_view)
+        except discord.HTTPException:
+            log.warning("Could not disable handled scheduling buttons for message=%s", interaction.message.id)
+
+
+class InvitationResponseView(discord.ui.View):
+    def __init__(self, client: NazzurathBot, disabled: bool = False) -> None:
+        super().__init__(timeout=None)
+        self.client = client
+        if disabled:
+            for item in self.children:
+                item.disabled = True
+
+    @discord.ui.button(
+        label="Accept",
+        style=discord.ButtonStyle.success,
+        custom_id="schedule:invitation:accept:v1",
+    )
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await handle_scheduling_response(interaction, "invitation", "accepted")
+
+    @discord.ui.button(
+        label="Decline",
+        style=discord.ButtonStyle.secondary,
+        custom_id="schedule:invitation:decline:v1",
+    )
+    async def decline(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await handle_scheduling_response(interaction, "invitation", "declined")
+
+
+class SessionResponseView(discord.ui.View):
+    def __init__(
+        self,
+        client: NazzurathBot,
+        disabled: bool = False,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.client = client
+        self.add_item(
+            discord.ui.Button(
+                label="Open schedule",
+                style=discord.ButtonStyle.link,
+                url=url or f"{client.scheduling.website_url}/schedule",
+            )
+        )
+        if disabled:
+            for item in self.children:
+                item.disabled = True
+
+    @discord.ui.button(
+        label="Attending",
+        style=discord.ButtonStyle.success,
+        custom_id="schedule:session:accept:v1",
+    )
+    async def accept(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await handle_scheduling_response(interaction, "session", "accepted")
+
+    @discord.ui.button(
+        label="Decline",
+        style=discord.ButtonStyle.secondary,
+        custom_id="schedule:session:decline:v1",
+    )
+    async def decline(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        await handle_scheduling_response(interaction, "session", "declined")
+
+
+def scheduling_view(notification: SchedulingNotification) -> discord.ui.View | None:
+    rendered = render_notification(notification, bot.scheduling.website_url)
+    if rendered.response_kind == "invitation":
+        return InvitationResponseView(bot)
+    if rendered.response_kind == "session":
+        return SessionResponseView(bot, url=rendered.url)
+    return None
+
+
+async def deliver_scheduling_notification(notification: SchedulingNotification) -> None:
+    rendered = render_notification(notification, bot.scheduling.website_url)
+    recipient_id = int(notification.recipient_discord_id)
+    user = bot.get_user(recipient_id)
+    if user is None:
+        user = await bot.fetch_user(recipient_id)
+    embed = discord.Embed(
+        title=shorten(rendered.title, 256),
+        description=shorten(rendered.description, 4096),
+        url=rendered.url,
+        color=discord.Color.from_rgb(146, 113, 63),
+        timestamp=discord.utils.utcnow(),
+    )
+    embed.set_footer(text="Tazzurath scheduling")
+    message = await user.send(
+        embed=embed,
+        view=scheduling_view(notification),
+        allowed_mentions=discord.AllowedMentions.none(),
+    )
+    await bot.scheduling.mark_notification_sent(notification.id, str(message.id))
+    log.info(
+        "Delivered scheduling notification id=%s event=%s recipient=%s",
+        notification.id,
+        notification.event_type,
+        notification.recipient_discord_id,
+    )
 
 
 async def has_admin_role(interaction: discord.Interaction) -> bool:
@@ -453,11 +635,114 @@ async def before_scheduled_reports() -> None:
     await bot.wait_until_ready()
 
 
+@tasks.loop(seconds=15)
+async def scheduling_notification_worker() -> None:
+    if not bot.scheduling.configured:
+        return
+    try:
+        await bot.scheduling.release_stale_claims()
+        notifications = await bot.scheduling.claim_due_notifications()
+    except Exception as exc:
+        log.error("Scheduling notification claim failed: %s", type(exc).__name__)
+        return
+
+    for notification in notifications:
+        try:
+            await deliver_scheduling_notification(notification)
+        except (discord.Forbidden, discord.NotFound) as exc:
+            log.warning(
+                "Scheduling DM permanently unavailable id=%s recipient=%s error=%s",
+                notification.id,
+                notification.recipient_discord_id,
+                type(exc).__name__,
+            )
+            try:
+                await bot.scheduling.mark_notification_failed(
+                    notification,
+                    f"{type(exc).__name__}: Discord private delivery unavailable",
+                )
+            except Exception as database_error:
+                log.error(
+                    "Could not persist permanent scheduling failure id=%s: %s",
+                    notification.id,
+                    type(database_error).__name__,
+                )
+        except Exception as exc:
+            try:
+                if notification.attempt_count >= MAX_NOTIFICATION_ATTEMPTS:
+                    await bot.scheduling.mark_notification_failed(
+                        notification,
+                        f"{type(exc).__name__}: delivery retries exhausted",
+                    )
+                    log.error(
+                        "Scheduling notification exhausted retries id=%s event=%s",
+                        notification.id,
+                        notification.event_type,
+                    )
+                else:
+                    await bot.scheduling.mark_notification_retry(
+                        notification.id,
+                        notification.attempt_count,
+                        f"{type(exc).__name__}: transient delivery failure",
+                    )
+                    log.warning(
+                        "Scheduling notification will retry id=%s attempt=%s error=%s",
+                        notification.id,
+                        notification.attempt_count,
+                        type(exc).__name__,
+                    )
+            except Exception as database_error:
+                log.error(
+                    "Could not persist scheduling retry id=%s: %s",
+                    notification.id,
+                    type(database_error).__name__,
+                )
+
+
+@scheduling_notification_worker.before_loop
+async def before_scheduling_notification_worker() -> None:
+    await bot.wait_until_ready()
+
+
+@tasks.loop(minutes=10)
+async def scheduling_member_sync() -> None:
+    if not bot.scheduling.configured or not DISCORD_GUILD_ID:
+        return
+    try:
+        guild = bot.get_guild(DISCORD_GUILD_ID)
+        if guild is None:
+            guild = await bot.fetch_guild(DISCORD_GUILD_ID)
+        members = [member async for member in guild.fetch_members(limit=None) if not member.bot]
+        records = [
+            GuildMemberRecord(
+                discord_id=str(member.id),
+                username=member.name,
+                display_name=member.display_name,
+                avatar_url=str(member.display_avatar.url) if member.display_avatar else None,
+                role_ids=tuple(str(role.id) for role in member.roles),
+            )
+            for member in members
+        ]
+        synced = await bot.scheduling.sync_guild_members(records)
+        log.info("Synchronized %s Discord guild members", synced)
+    except Exception as exc:
+        log.error("Scheduling member synchronization failed: %s", type(exc).__name__)
+
+
+@scheduling_member_sync.before_loop
+async def before_scheduling_member_sync() -> None:
+    await bot.wait_until_ready()
+
+
 @bot.event
 async def on_ready() -> None:
     log.info("Logged in as %s (%s)", bot.user, bot.user.id if bot.user else "unknown")
     if not bot.github.configured:
         log.warning("GitHub integration is disabled: set GITHUB_TOKEN")
+    if not bot.scheduling.configured:
+        log.warning("Scheduling integration is disabled: set DATABASE_URL")
+    elif not DISCORD_GUILD_ID:
+        log.warning("Scheduling member synchronization is disabled: set DISCORD_GUILD_ID")
 
 
 if __name__ == "__main__":
