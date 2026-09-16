@@ -90,6 +90,9 @@ class FakeConnection:
     def transaction(self):
         return self
 
+    def cursor(self):
+        return self
+
     async def execute(self, query, params=None):
         normalized = " ".join(query.split())
         self.calls.append((normalized, params))

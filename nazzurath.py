@@ -726,7 +726,7 @@ async def scheduling_member_sync() -> None:
         synced = await bot.scheduling.sync_guild_members(records)
         log.info("Synchronized %s Discord guild members", synced)
     except Exception as exc:
-        log.error("Scheduling member synchronization failed: %s", type(exc).__name__)
+        log.exception("Scheduling member synchronization failed: %s", type(exc).__name__)
 
 
 @scheduling_member_sync.before_loop

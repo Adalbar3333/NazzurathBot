@@ -288,33 +288,34 @@ class SchedulingService:
             async with self.pool.connection() as conn:
                 async with conn.transaction():
                     if records:
-                        await conn.executemany(
-                            """
-                            INSERT INTO discord_members (
-                                discord_id, username, display_name, avatar_url, role_ids,
-                                active, last_synced_at, updated_at
-                            )
-                            VALUES (%s, %s, %s, %s, %s, TRUE, NOW(), NOW())
-                            ON CONFLICT (discord_id) DO UPDATE SET
-                                username = EXCLUDED.username,
-                                display_name = EXCLUDED.display_name,
-                                avatar_url = EXCLUDED.avatar_url,
-                                role_ids = EXCLUDED.role_ids,
-                                active = TRUE,
-                                last_synced_at = NOW(),
-                                updated_at = NOW()
-                            """,
-                            [
-                                (
-                                    member.discord_id,
-                                    member.username,
-                                    member.display_name,
-                                    member.avatar_url,
-                                    Jsonb(list(member.role_ids)),
+                        async with conn.cursor() as cursor:
+                            await cursor.executemany(
+                                """
+                                INSERT INTO discord_members (
+                                    discord_id, username, display_name, avatar_url, role_ids,
+                                    active, last_synced_at, updated_at
                                 )
-                                for member in records
-                            ],
-                        )
+                                VALUES (%s, %s, %s, %s, %s, TRUE, NOW(), NOW())
+                                ON CONFLICT (discord_id) DO UPDATE SET
+                                    username = EXCLUDED.username,
+                                    display_name = EXCLUDED.display_name,
+                                    avatar_url = EXCLUDED.avatar_url,
+                                    role_ids = EXCLUDED.role_ids,
+                                    active = TRUE,
+                                    last_synced_at = NOW(),
+                                    updated_at = NOW()
+                                """,
+                                [
+                                    (
+                                        member.discord_id,
+                                        member.username,
+                                        member.display_name,
+                                        member.avatar_url,
+                                        Jsonb(list(member.role_ids)),
+                                    )
+                                    for member in records
+                                ],
+                            )
                         await conn.execute(
                             """
                             UPDATE discord_members
