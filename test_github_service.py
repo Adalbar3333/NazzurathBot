@@ -12,6 +12,7 @@ from github_service import (
     apply_comments,
     decode_tagged_body,
     page_from_path,
+    proposals_resolved_since,
     proposal_from_issue,
 )
 
@@ -79,6 +80,37 @@ class GitHubServiceTests(unittest.TestCase):
         page = page_from_path("content/Gods and Godhood/My Page.md", "https://www.tazzurath.com/")
         self.assertEqual(page.title, "My Page")
         self.assertEqual(page.url, "https://www.tazzurath.com/read/Gods%20and%20Godhood/My%20Page")
+
+    def test_records_decision_time_and_filters_resolutions_since_last_report(self):
+        issue = {
+            "number": 8,
+            "title": "Frost Wyrm",
+            "body": tagged(POST_TAG, {"authorName": "Ada"}, "Details"),
+            "html_url": "https://github.com/o/r/issues/8",
+            "created_at": "2026-09-12T12:00:00Z",
+        }
+        proposal = proposal_from_issue(issue)
+        resolved = apply_comments(proposal, [{
+            "created_at": "2026-09-17T11:00:00Z",
+            "body": tagged(EVENT_TAG, {"type": "decision", "decision": "approved"}),
+        }])
+
+        self.assertEqual(resolved.status, "approved")
+        self.assertEqual(resolved.decided_at, datetime(2026, 9, 17, 11, tzinfo=timezone.utc))
+        self.assertEqual(
+            proposals_resolved_since(
+                [resolved],
+                datetime(2026, 9, 17, 10, tzinfo=timezone.utc),
+            ),
+            [resolved],
+        )
+        self.assertEqual(
+            proposals_resolved_since(
+                [resolved],
+                datetime(2026, 9, 17, 12, tzinfo=timezone.utc),
+            ),
+            [],
+        )
 
     def test_ignores_non_content_files(self):
         self.assertIsNone(page_from_path("README.md", "https://example.com"))

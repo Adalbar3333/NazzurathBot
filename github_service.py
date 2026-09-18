@@ -38,6 +38,7 @@ class Proposal:
     status: str = "open"
     approve: int = 0
     disapprove: int = 0
+    decided_at: datetime | None = None
 
     @property
     def status_label(self) -> str:
@@ -109,6 +110,7 @@ def proposal_from_issue(issue: dict[str, Any], signing_secret: str = "") -> Prop
 
 def apply_comments(proposal: Proposal, comments: list[dict[str, Any]], signing_secret: str = "") -> Proposal:
     status = "open"
+    decided_at: datetime | None = None
     votes: dict[str, tuple[str, int]] = {}
     for comment in comments:
         tagged = decode_tagged_body(str(comment.get("body") or ""), EVENT_TAG)
@@ -120,8 +122,14 @@ def apply_comments(proposal: Proposal, comments: list[dict[str, Any]], signing_s
         event_type = metadata.get("type")
         if event_type == "call-vote":
             status = "voting"
+            decided_at = None
         elif event_type == "decision" and metadata.get("decision") in {"approved", "disapproved"}:
             status = str(metadata["decision"])
+            timestamp = comment.get("created_at") or metadata.get("at")
+            try:
+                decided_at = parse_timestamp(str(timestamp)) if timestamp else None
+            except ValueError:
+                decided_at = None
         elif event_type == "vote" and metadata.get("authorKey"):
             author_key = str(metadata["authorKey"])
             choice = metadata.get("choice")
@@ -135,7 +143,26 @@ def apply_comments(proposal: Proposal, comments: list[dict[str, Any]], signing_s
                 votes.pop(author_key, None)
     approve = sum(weight for choice, weight in votes.values() if choice == "approve")
     disapprove = sum(weight for choice, weight in votes.values() if choice == "disapprove")
-    return replace(proposal, status=status, approve=approve, disapprove=disapprove)
+    return replace(
+        proposal,
+        status=status,
+        approve=approve,
+        disapprove=disapprove,
+        decided_at=decided_at,
+    )
+
+
+def proposals_resolved_since(proposals: list[Proposal], since: datetime) -> list[Proposal]:
+    return sorted(
+        (
+            proposal
+            for proposal in proposals
+            if proposal.status in {"approved", "disapproved"}
+            and proposal.decided_at is not None
+            and proposal.decided_at > since
+        ),
+        key=lambda proposal: proposal.decided_at or since,
+    )
 
 
 def page_from_path(path: str, website_url: str) -> SitePage | None:
@@ -181,7 +208,7 @@ class GitHubService:
             branch=os.getenv("GITHUB_BRANCH", "main"),
             website_url=os.getenv("WEBSITE_URL", "https://www.tazzurath.com"),
             signing_secret=os.getenv("HOMEBREW_SIGNING_SECRET", ""),
-            max_posts=int(os.getenv("MAX_HOMEBREW_POSTS", "40")),
+            max_posts=int(os.getenv("MAX_HOMEBREW_POSTS", "100")),
         )
 
     @property

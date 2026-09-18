@@ -62,6 +62,57 @@ class NotificationFormattingTests(unittest.TestCase):
         self.assertIn("group=group-1", rendered.url)
         self.assertIn("session=session-1", rendered.url)
 
+    def test_homebrew_submission_receipt_links_to_the_exact_post(self):
+        notification = SchedulingNotification(
+            id="notification-3",
+            recipient_discord_id="123",
+            event_type="homebrew_submitted",
+            payload={"post_id": "42", "title": "Frost Wyrm"},
+            attempt_count=1,
+        )
+
+        rendered = render_notification(notification, "https://www.tazzurath.com/")
+
+        self.assertEqual(rendered.title, "Homebrew submission received")
+        self.assertIn("Frost Wyrm", rendered.description)
+        self.assertEqual(
+            rendered.url,
+            "https://www.tazzurath.com/homebrew-registry#homebrew-post-42",
+        )
+
+    def test_homebrew_decision_uses_published_page_or_settled_post(self):
+        approved = SchedulingNotification(
+            id="notification-4",
+            recipient_discord_id="123",
+            event_type="homebrew_decision",
+            payload={
+                "post_id": "42",
+                "title": "Frost Wyrm",
+                "decision": "approved",
+                "decision_by": "The Archivist",
+                "published_url": "/read/homebrew/frost-wyrm",
+            },
+            attempt_count=1,
+        )
+        denied = SchedulingNotification(
+            id="notification-5",
+            recipient_discord_id="123",
+            event_type="homebrew_decision",
+            payload={"post_id": "43", "title": "Hot Ice", "decision": "disapproved"},
+            attempt_count=1,
+        )
+
+        self.assertEqual(
+            render_notification(approved, "https://www.tazzurath.com").url,
+            "https://www.tazzurath.com/read/homebrew/frost-wyrm",
+        )
+        denied_rendered = render_notification(denied, "https://www.tazzurath.com")
+        self.assertEqual(denied_rendered.title, "Homebrew denied")
+        self.assertEqual(
+            denied_rendered.url,
+            "https://www.tazzurath.com/homebrew-registry/settled#homebrew-post-43",
+        )
+
 
 class FakeCursor:
     def __init__(self, rows=None, rowcount=0):

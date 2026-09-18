@@ -10,8 +10,8 @@ features, and connects the website's DM scheduling system to Discord.
   submission (a GitHub Issue with the `tazzurath-homebrew` label) is posted in
   Discord channel `1548461625865015466`.
 - At 6:00 AM Central Time, posts every undecided proposal that members can
-  currently vote on, including weighted approve/disapprove totals. It says
-  nothing when the list is empty.
+  currently vote on, including weighted approve/disapprove totals, plus every
+  proposal approved or denied since the previous voting update.
 - At 12:00 PM Central Time, posts every Markdown page added under `content/` on
   the website's `main` branch since local midnight. It says nothing when no page
   was added.
@@ -25,9 +25,10 @@ features, and connects the website's DM scheduling system to Discord.
 - Synchronizes current Discord members, display names, avatars, and roles to the
   website's PostgreSQL database every ten minutes. Members who leave are marked
   inactive instead of being deleted.
-- Delivers durable scheduling invitations, session changes, cancellations, and
-  24-hour/1-hour reminders by DM. Invitation and session messages have
-  persistent response buttons that still work after a bot restart.
+- Delivers durable scheduling invitations, session changes, cancellations,
+  24-hour/1-hour reminders, homebrew submission receipts, and homebrew decision
+  notices by DM. Invitation and session messages have persistent response
+  buttons that still work after a bot restart.
 - Records Accept/Decline and Attending/Decline responses in the shared database
   and notifies the group's managers. A failed private message remains visible on
   the website and creates a manager-facing delivery warning.

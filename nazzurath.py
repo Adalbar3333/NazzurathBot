@@ -7,7 +7,7 @@ import os
 import random
 import re
 from collections import defaultdict
-from datetime import datetime, time
+from datetime import datetime, time, timedelta
 from pathlib import Path
 from typing import Optional
 from zoneinfo import ZoneInfo
@@ -18,7 +18,7 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from github_service import GitHubError, GitHubService, Proposal
+from github_service import GitHubError, GitHubService, Proposal, proposals_resolved_since
 from scheduling_service import (
     MAX_NOTIFICATION_ATTEMPTS,
     GuildMemberRecord,
@@ -345,7 +345,11 @@ async def deliver_scheduling_notification(notification: SchedulingNotification) 
         color=discord.Color.from_rgb(146, 113, 63),
         timestamp=discord.utils.utcnow(),
     )
-    embed.set_footer(text="Tazzurath scheduling")
+    embed.set_footer(
+        text="Tazzurath homebrew"
+        if notification.event_type.startswith("homebrew_")
+        else "Tazzurath scheduling"
+    )
     message = await user.send(
         embed=embed,
         view=scheduling_view(notification),
@@ -506,6 +510,13 @@ async def report_marker_exists(channel: discord.TextChannel, marker: str, after:
     return False
 
 
+async def latest_report_time(channel: discord.TextChannel, marker_prefix: str) -> datetime | None:
+    async for message in channel.history(limit=500):
+        if any((embed.footer.text or "").startswith(marker_prefix) for embed in message.embeds):
+            return message.created_at
+    return None
+
+
 async def announce_proposal(channel: discord.TextChannel, proposal: Proposal) -> None:
     description = shorten(proposal.body, 1000) or "No description provided."
     embed = discord.Embed(
@@ -539,20 +550,38 @@ async def send_vote_report(channel: discord.TextChannel, now: datetime) -> None:
     midnight = datetime.combine(now.date(), time.min, tzinfo=CENTRAL)
     if await report_marker_exists(channel, marker, midnight):
         return
+    previous_report_at = await latest_report_time(channel, "NazzurathBot:vote-report:")
+    resolution_cutoff = previous_report_at or (now - timedelta(days=1))
     proposals = await bot.github.list_proposals(include_comments=True)
     voteable = [proposal for proposal in proposals if proposal.status not in {"approved", "disapproved"}]
-    if not voteable:
-        log.info("No voteable proposals; no 6 AM message sent")
+    resolved = proposals_resolved_since(proposals, resolution_cutoff)
+    if not voteable and not resolved:
+        log.info("No voteable or newly resolved proposals; no 6 AM message sent")
         return
 
-    lines = [
-        f"• [#{item.number} — {discord.utils.escape_markdown(shorten(item.title, 110))}]({bot.github.registry_url}) "
-        f"— {item.status_label}; **{item.approve}** approve / **{item.disapprove}** disapprove"
-        for item in voteable
-    ]
+    lines: list[str] = []
+    if resolved:
+        lines.append("**Resolved since the previous voting update**")
+        lines.extend(
+            f"• {'✅' if item.status == 'approved' else '❌'} "
+            f"[#{item.number} — {discord.utils.escape_markdown(shorten(item.title, 110))}]"
+            f"({bot.github.registry_url}/settled#homebrew-post-{item.number}) — "
+            f"**{'Approved' if item.status == 'approved' else 'Denied'}**"
+            for item in resolved
+        )
+    if voteable:
+        if lines:
+            lines.append("")
+        lines.append("**Currently open for voting**")
+        lines.extend(
+            f"• [#{item.number} — {discord.utils.escape_markdown(shorten(item.title, 110))}]"
+            f"({bot.github.registry_url}#homebrew-post-{item.number}) "
+            f"— {item.status_label}; **{item.approve}** approve / **{item.disapprove}** disapprove"
+            for item in voteable
+        )
     for index, description in enumerate(chunk_lines(lines)):
         embed = discord.Embed(
-            title="Current homebrew submissions to vote on" if index == 0 else "Homebrew submissions (continued)",
+            title="Homebrew voting update" if index == 0 else "Homebrew voting update (continued)",
             description=description,
             url=bot.github.registry_url,
             color=discord.Color.gold(),

@@ -5,7 +5,7 @@ import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from typing import Any, Iterable, Mapping, Sequence
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urljoin
 
 from psycopg.rows import dict_row
 from psycopg.types.json import Jsonb
@@ -103,6 +103,17 @@ def _schedule_url(website_url: str, payload: Mapping[str, Any]) -> str:
     return f"{base}?{urlencode(params)}" if params else base
 
 
+def _homebrew_url(website_url: str, payload: Mapping[str, Any], settled: bool = False) -> str:
+    published_url = str(payload.get("published_url") or "").strip()
+    if published_url:
+        return urljoin(f"{website_url.rstrip('/')}/", published_url)
+    base = f"{website_url.rstrip('/')}/homebrew-registry"
+    if settled:
+        base += "/settled"
+    post_id = str(_value(payload, "post_id", "postId") or "").strip()
+    return f"{base}#homebrew-post-{post_id}" if post_id else base
+
+
 def render_notification(
     notification: SchedulingNotification,
     website_url: str,
@@ -110,6 +121,26 @@ def render_notification(
     """Build Discord-safe copy from the durable website notification payload."""
     payload = notification.payload
     event_type = notification.event_type
+    if event_type == "homebrew_submitted":
+        title = _clean(payload.get("title"), "Your homebrew submission")
+        return RenderedNotification(
+            title="Homebrew submission received",
+            description=(
+                f"**{title}** was submitted for community review. "
+                "I’ll send you another PM when an administrator approves or denies it."
+            ),
+            url=_homebrew_url(website_url, payload),
+        )
+    if event_type == "homebrew_decision":
+        title = _clean(payload.get("title"), "Your homebrew submission")
+        approved = payload.get("decision") == "approved"
+        decision = "approved" if approved else "denied"
+        decision_by = _clean(payload.get("decision_by"), "an administrator")
+        return RenderedNotification(
+            title=f"Homebrew {decision}",
+            description=f"**{title}** was **{decision}** by **{decision_by}**.",
+            url=_homebrew_url(website_url, payload, settled=not approved),
+        )
     group_name = _clean(_value(payload, "group_name", "groupName"), "your group")
     actor_name = _clean(
         _value(
