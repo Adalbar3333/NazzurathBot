@@ -32,6 +32,9 @@ features, and connects the website's DM scheduling system to Discord.
 - Records Accept/Decline and Attending/Decline responses in the shared database
   and notifies the group's managers. A failed private message remains visible on
   the website and creates a manager-facing delivery warning.
+- Sends the scheduling DM a manager receipt with **Edit on website** and
+  **Cancel session** controls. `/sessions` lists every future date the member
+  can manage and can cancel an older date that predates its Discord receipt.
 - Exposes `/health` on `PORT` for host health checks.
 
 The GitHub integration only needs read access to the website repository. The

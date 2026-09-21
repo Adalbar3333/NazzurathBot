@@ -189,14 +189,14 @@ def render_notification(
             title="New session scheduled",
             description=f"**{group_name}** has a session scheduled for {when}.",
             url=url,
-            response_kind="session",
+            response_kind="session_manager" if payload.get("can_manage") is True else "session",
         )
     if event_type == "session_rescheduled":
         return RenderedNotification(
             title="Session rescheduled",
             description=f"The **{group_name}** session is now scheduled for {when}. Please respond again.",
             url=url,
-            response_kind="session",
+            response_kind="session_manager" if payload.get("can_manage") is True else "session",
         )
     if event_type == "session_cancelled":
         return RenderedNotification(
@@ -239,10 +239,17 @@ def render_notification(
 class SchedulingService:
     """Shared PostgreSQL service for Discord member sync and the notification outbox."""
 
-    def __init__(self, database_url: str, website_url: str, pool: Any | None = None) -> None:
+    def __init__(
+        self,
+        database_url: str,
+        website_url: str,
+        pool: Any | None = None,
+        privileged_role_ids: Sequence[str] = (),
+    ) -> None:
         self.database_url = database_url.strip()
         self.website_url = website_url.rstrip("/") or "https://www.tazzurath.com"
         self.pool: Any | None = pool
+        self.privileged_role_ids = tuple(str(role_id) for role_id in privileged_role_ids if role_id)
         self.database_healthy = False
         self.last_error: str | None = None
         self.last_notification_run_at: datetime | None = None
@@ -253,6 +260,10 @@ class SchedulingService:
         return cls(
             database_url=os.getenv("DATABASE_URL", ""),
             website_url=os.getenv("WEBSITE_URL", "https://www.tazzurath.com"),
+            privileged_role_ids=(
+                os.getenv("DISCORD_DM_ROLE_ID", ""),
+                os.getenv("ADMIN_ROLE_ID", ""),
+            ),
         )
 
     @property
@@ -281,7 +292,10 @@ class SchedulingService:
                 await conn.execute("SELECT 1")
             self.database_healthy = True
             self.last_error = None
+            backfilled = await self._backfill_manager_session_notifications()
             log.info("Scheduling database connection is ready")
+            if backfilled:
+                log.info("Queued %s missing scheduling-manager receipt(s)", backfilled)
             return True
         except Exception as exc:
             self.database_healthy = False
@@ -300,6 +314,239 @@ class SchedulingService:
         if self.pool is not None:
             await self.pool.close()
         self.database_healthy = False
+
+    async def _backfill_manager_session_notifications(self) -> int:
+        """Queue the missing DM receipt for future sessions created before manager DMs existed."""
+        assert self.pool is not None
+        async with self.pool.connection() as conn:
+            cursor = await conn.execute(
+                """
+                INSERT INTO notifications (
+                    recipient_discord_id, event_type, related_entity_type,
+                    related_entity_id, payload, discord_delivery_status,
+                    due_at, attempt_count, idempotency_key
+                )
+                SELECT session_row.created_by_discord_id, 'session_confirmed', 'session',
+                       session_row.id,
+                       jsonb_build_object(
+                           'group_id', group_row.id::text,
+                           'group_name', group_row.name,
+                           'session_id', session_row.id::text,
+                           'starts_at', session_row.starts_at,
+                           'ends_at', session_row.ends_at,
+                           'timezone', session_row.timezone,
+                           'revision', session_row.revision,
+                           'can_manage', TRUE,
+                           'manager_discord_id', session_row.created_by_discord_id
+                       ),
+                       'pending', NOW(), 0,
+                       'session-manager-receipt:' || session_row.id::text || ':' ||
+                           session_row.revision::text || ':' || session_row.created_by_discord_id
+                FROM sessions AS session_row
+                JOIN scheduling_groups AS group_row ON group_row.id = session_row.group_id
+                WHERE session_row.status = 'confirmed'
+                  AND session_row.starts_at >= NOW()
+                  AND session_row.created_by_discord_id IS NOT NULL
+                  AND NOT EXISTS (
+                      SELECT 1 FROM notifications AS existing
+                      WHERE existing.related_entity_type = 'session'
+                        AND existing.related_entity_id = session_row.id
+                        AND existing.recipient_discord_id = session_row.created_by_discord_id
+                        AND existing.event_type IN ('session_confirmed', 'session_rescheduled')
+                        AND existing.payload->>'revision' = session_row.revision::text
+                  )
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """
+            )
+        return max(0, cursor.rowcount)
+
+    async def list_managed_sessions(self, actor_discord_id: str, limit: int = 25) -> list[dict[str, Any]]:
+        """List future dates the Discord member is allowed to manage."""
+        if not await self.ensure_connected():
+            return []
+        assert self.pool is not None
+        try:
+            async with self.pool.connection() as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT session_row.id, session_row.group_id, group_row.name AS group_name,
+                           session_row.starts_at, session_row.ends_at, session_row.timezone,
+                           session_row.revision
+                    FROM sessions AS session_row
+                    JOIN scheduling_groups AS group_row ON group_row.id = session_row.group_id
+                    WHERE session_row.status = 'confirmed'
+                      AND session_row.starts_at >= NOW()
+                      AND (
+                          group_row.owner_discord_id = %s
+                          OR EXISTS (
+                              SELECT 1 FROM group_memberships AS manager
+                              WHERE manager.group_id = group_row.id
+                                AND manager.discord_id = %s
+                                AND manager.status = 'accepted'
+                                AND manager.role = 'co_dm'
+                          )
+                          OR EXISTS (
+                              SELECT 1 FROM discord_members AS manager_member
+                              WHERE manager_member.discord_id = %s
+                                AND manager_member.role_ids ?| %s::text[]
+                          )
+                      )
+                    ORDER BY session_row.starts_at
+                    LIMIT %s
+                    """,
+                    (
+                        actor_discord_id,
+                        actor_discord_id,
+                        actor_discord_id,
+                        list(self.privileged_role_ids),
+                        max(1, min(int(limit), 25)),
+                    ),
+                )
+                rows = await cursor.fetchall()
+            self._record_success()
+            return [dict(row) for row in rows]
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def cancel_managed_session(
+        self,
+        actor_discord_id: str,
+        session_id: str,
+        expected_revision: int | None = None,
+    ) -> ResponseOutcome:
+        """Cancel a future session from Discord and notify the remaining roster."""
+        if not await self.ensure_connected():
+            return ResponseOutcome(False, "Scheduling is temporarily unavailable. Please use the website.")
+        assert self.pool is not None
+        try:
+            async with self.pool.connection() as conn:
+                async with conn.transaction():
+                    outcome = await self._cancel_managed_session(
+                        conn,
+                        actor_discord_id,
+                        session_id,
+                        expected_revision,
+                    )
+            self._record_success()
+            return outcome
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def _cancel_managed_session(
+        self,
+        conn: Any,
+        actor_discord_id: str,
+        session_id: str,
+        expected_revision: int | None = None,
+    ) -> ResponseOutcome:
+        cursor = await conn.execute(
+            """
+            SELECT session_row.*, group_row.name AS group_name,
+                   group_row.owner_discord_id
+            FROM sessions AS session_row
+            JOIN scheduling_groups AS group_row ON group_row.id = session_row.group_id
+            WHERE session_row.id = %s
+              AND (
+                  group_row.owner_discord_id = %s
+                  OR EXISTS (
+                      SELECT 1 FROM group_memberships AS manager
+                      WHERE manager.group_id = group_row.id
+                        AND manager.discord_id = %s
+                        AND manager.status = 'accepted'
+                        AND manager.role = 'co_dm'
+                  )
+                  OR EXISTS (
+                      SELECT 1 FROM discord_members AS manager_member
+                      WHERE manager_member.discord_id = %s
+                        AND manager_member.role_ids ?| %s::text[]
+                  )
+              )
+            FOR UPDATE OF session_row
+            """,
+            (
+                session_id,
+                actor_discord_id,
+                actor_discord_id,
+                actor_discord_id,
+                list(self.privileged_role_ids),
+            ),
+        )
+        session = await cursor.fetchone()
+        if session is None:
+            return ResponseOutcome(False, "That session does not exist or you are not allowed to cancel it.")
+        if str(session["status"]) == "cancelled":
+            return ResponseOutcome(True, "That session is already cancelled.", "cancelled")
+        if expected_revision is not None and int(session["revision"]) != int(expected_revision):
+            return ResponseOutcome(False, "That date was replaced by a newer one. Open the latest scheduling message.")
+
+        await conn.execute(
+            "UPDATE sessions SET status = 'cancelled', updated_at = NOW() WHERE id = %s",
+            (session_id,),
+        )
+        await conn.execute(
+            """
+            UPDATE notifications
+            SET discord_delivery_status = 'cancelled', updated_at = NOW()
+            WHERE related_entity_type = 'session' AND related_entity_id = %s
+              AND discord_delivery_status = 'pending'
+            """,
+            (session_id,),
+        )
+        attendees_cursor = await conn.execute(
+            """
+            SELECT attendee.discord_id, member.display_name
+            FROM session_attendees AS attendee
+            JOIN discord_members AS member ON member.discord_id = attendee.discord_id
+            WHERE attendee.session_id = %s
+            """,
+            (session_id,),
+        )
+        attendees = await attendees_cursor.fetchall()
+        payload_base = {
+            "group_id": str(session["group_id"]),
+            "group_name": str(session["group_name"]),
+            "session_id": str(session_id),
+            "starts_at": session["starts_at"].isoformat(),
+            "ends_at": session["ends_at"].isoformat(),
+            "timezone": str(session["timezone"]),
+            "revision": int(session["revision"]),
+        }
+        for attendee in attendees:
+            recipient_id = str(attendee["discord_id"])
+            if recipient_id == actor_discord_id:
+                continue
+            await conn.execute(
+                """
+                INSERT INTO notifications (
+                    recipient_discord_id, event_type, related_entity_type,
+                    related_entity_id, payload, discord_delivery_status,
+                    due_at, attempt_count, idempotency_key
+                )
+                VALUES (%s, 'session_cancelled', 'session', %s, %s, 'pending', NOW(), 0, %s)
+                ON CONFLICT (idempotency_key) DO NOTHING
+                """,
+                (
+                    recipient_id,
+                    session_id,
+                    Jsonb({**payload_base, "recipient_name": attendee["display_name"]}),
+                    f"session-cancelled:{session_id}:{recipient_id}",
+                ),
+            )
+        await conn.execute(
+            """
+            INSERT INTO scheduling_audit_log (
+                actor_discord_id, action, entity_type, entity_id, details
+            ) VALUES (%s, 'session.cancelled.discord', 'session', %s, %s)
+            """,
+            (actor_discord_id, session_id, Jsonb({"source": "discord"})),
+        )
+        return ResponseOutcome(
+            True,
+            f"The **{session['group_name']}** session has been cancelled. Everyone on the roster will be notified.",
+            "cancelled",
+        )
 
     def _record_success(self) -> None:
         self.database_healthy = True
@@ -555,7 +802,10 @@ class SchedulingService:
         response_kind: str,
         response: str,
     ) -> ResponseOutcome:
-        if response_kind not in {"invitation", "session"} or response not in {"accepted", "declined"}:
+        valid_response = (
+            response_kind in {"invitation", "session"} and response in {"accepted", "declined"}
+        ) or (response_kind == "session_manager" and response == "cancelled")
+        if not valid_response:
             return ResponseOutcome(False, "That scheduling response is not valid.")
         if not await self.ensure_connected():
             return ResponseOutcome(False, "Scheduling is temporarily unavailable. Please use the website.")
@@ -585,11 +835,28 @@ class SchedulingService:
                         outcome = await self._respond_to_invitation(
                             conn, payload, actor_discord_id, response
                         )
-                    else:
+                    elif response_kind == "session":
                         if event_type not in {"session_confirmed", "session_proposal", "session_rescheduled"}:
                             return ResponseOutcome(False, "This is not an active session proposal.")
                         outcome = await self._respond_to_session(
                             conn, payload, actor_discord_id, response
+                        )
+                    else:
+                        if event_type not in {"session_confirmed", "session_rescheduled"}:
+                            return ResponseOutcome(False, "This is not an active scheduled date.")
+                        if payload.get("can_manage") is not True:
+                            return ResponseOutcome(False, "This scheduling message does not have manager controls.")
+                        manager_id = str(_value(payload, "manager_discord_id", "managerDiscordId") or "")
+                        if manager_id and manager_id != actor_discord_id:
+                            return ResponseOutcome(False, "This manager control belongs to another member.")
+                        session_id = _value(payload, "session_id", "sessionId")
+                        if not session_id:
+                            return ResponseOutcome(False, "This message is missing its session reference.")
+                        outcome = await self._cancel_managed_session(
+                            conn,
+                            actor_discord_id,
+                            str(session_id),
+                            int(payload["revision"]) if payload.get("revision") is not None else None,
                         )
             self._record_success()
             return outcome

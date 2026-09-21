@@ -9,7 +9,7 @@ import re
 from collections import defaultdict
 from datetime import datetime, time, timedelta
 from pathlib import Path
-from typing import Optional
+from typing import Any, Optional
 from zoneinfo import ZoneInfo
 
 import discord
@@ -18,7 +18,12 @@ from discord import app_commands
 from discord.ext import commands, tasks
 from dotenv import load_dotenv
 
-from github_service import GitHubError, GitHubService, Proposal, proposals_resolved_since
+from github_service import (
+    GitHubError,
+    GitHubService,
+    Proposal,
+    proposals_resolved_since,
+)
 from scheduling_service import (
     MAX_NOTIFICATION_ATTEMPTS,
     GuildMemberRecord,
@@ -146,6 +151,7 @@ class NazzurathBot(commands.Bot):
         await self.scheduling.start()
         self.add_view(InvitationResponseView(self))
         self.add_view(SessionResponseView(self))
+        self.add_view(SessionManagerView(self))
         await self.start_health_server()
         homebrew_monitor.change_interval(seconds=POLL_SECONDS)
         homebrew_monitor.start()
@@ -249,6 +255,12 @@ async def handle_scheduling_response(
         disabled_view: discord.ui.View
         if response_kind == "invitation":
             disabled_view = InvitationResponseView(bot, disabled=True)
+        elif response_kind == "session_manager":
+            message_url = next(
+                (embed.url for embed in interaction.message.embeds if embed.url),
+                None,
+            )
+            disabled_view = SessionManagerView(bot, disabled=True, url=message_url)
         else:
             message_url = next(
                 (embed.url for embed in interaction.message.embeds if embed.url),
@@ -323,12 +335,92 @@ class SessionResponseView(discord.ui.View):
         await handle_scheduling_response(interaction, "session", "declined")
 
 
+class ConfirmManagerMessageCancellationView(discord.ui.View):
+    def __init__(self, actor_id: int, message: discord.Message) -> None:
+        super().__init__(timeout=120)
+        self.actor_id = actor_id
+        self.message = message
+
+    @discord.ui.button(label="Keep session", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("This confirmation belongs to another member.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="The scheduled date was not changed.", view=None)
+
+    @discord.ui.button(label="Confirm cancellation", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("This confirmation belongs to another member.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            outcome = await bot.scheduling.respond_to_message(
+                discord_message_id=str(self.message.id),
+                actor_discord_id=str(interaction.user.id),
+                response_kind="session_manager",
+                response="cancelled",
+            )
+        except Exception as exc:
+            log.error("Scheduling-message cancellation failed: %s", type(exc).__name__)
+            await interaction.edit_original_response(
+                content="I could not cancel that session. Please try again or use the scheduling website.",
+                view=None,
+            )
+            return
+        if outcome.ok and outcome.status:
+            message_url = next((embed.url for embed in self.message.embeds if embed.url), None)
+            try:
+                await self.message.edit(view=SessionManagerView(bot, disabled=True, url=message_url))
+            except discord.HTTPException:
+                log.warning("Could not disable cancelled session controls for message=%s", self.message.id)
+        await interaction.edit_original_response(content=outcome.message, view=None)
+
+
+class SessionManagerView(discord.ui.View):
+    def __init__(
+        self,
+        client: NazzurathBot,
+        disabled: bool = False,
+        url: str | None = None,
+    ) -> None:
+        super().__init__(timeout=None)
+        self.client = client
+        self.add_item(
+            discord.ui.Button(
+                label="Edit on website",
+                style=discord.ButtonStyle.link,
+                url=url or f"{client.scheduling.website_url}/schedule",
+            )
+        )
+        if disabled:
+            for item in self.children:
+                item.disabled = True
+
+    @discord.ui.button(
+        label="Cancel session",
+        style=discord.ButtonStyle.danger,
+        custom_id="schedule:session-manager:cancel:v1",
+    )
+    async def cancel(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.message is None:
+            await interaction.response.send_message("This scheduling message is no longer available.", ephemeral=True)
+            return
+        await interaction.response.send_message(
+            "Cancel this scheduled date? Everyone on its roster will be notified.",
+            view=ConfirmManagerMessageCancellationView(interaction.user.id, interaction.message),
+            ephemeral=True,
+        )
+
+
 def scheduling_view(notification: SchedulingNotification) -> discord.ui.View | None:
     rendered = render_notification(notification, bot.scheduling.website_url)
     if rendered.response_kind == "invitation":
         return InvitationResponseView(bot)
     if rendered.response_kind == "session":
         return SessionResponseView(bot, url=rendered.url)
+    if rendered.response_kind == "session_manager":
+        return SessionManagerView(bot, url=rendered.url)
     return None
 
 
@@ -361,6 +453,138 @@ async def deliver_scheduling_notification(notification: SchedulingNotification) 
         notification.id,
         notification.event_type,
         notification.recipient_discord_id,
+    )
+
+
+def managed_session_label(session: dict[str, Any]) -> str:
+    starts_at = session.get("starts_at")
+    if isinstance(starts_at, datetime):
+        date_label = starts_at.strftime("%b %d, %Y")
+    else:
+        date_label = "Scheduled date"
+    return shorten(f"{session.get('group_name') or 'Campaign'} — {date_label}", 100)
+
+
+class ConfirmSessionCancellationView(discord.ui.View):
+    def __init__(self, actor_id: int, session: dict[str, Any]) -> None:
+        super().__init__(timeout=120)
+        self.actor_id = actor_id
+        self.session = session
+
+    @discord.ui.button(label="Keep session", style=discord.ButtonStyle.secondary)
+    async def keep(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("This confirmation belongs to another member.", ephemeral=True)
+            return
+        await interaction.response.edit_message(content="The scheduled date was not changed.", view=None)
+
+    @discord.ui.button(label="Confirm cancellation", style=discord.ButtonStyle.danger)
+    async def confirm(self, interaction: discord.Interaction, _: discord.ui.Button) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("This confirmation belongs to another member.", ephemeral=True)
+            return
+        await interaction.response.defer()
+        try:
+            outcome = await bot.scheduling.cancel_managed_session(
+                actor_discord_id=str(interaction.user.id),
+                session_id=str(self.session["id"]),
+                expected_revision=int(self.session["revision"]),
+            )
+        except Exception as exc:
+            log.error("Slash-command session cancellation failed: %s", type(exc).__name__)
+            await interaction.edit_original_response(
+                content="I could not cancel that session. Please try again or use the scheduling website.",
+                view=None,
+            )
+            return
+        await interaction.edit_original_response(content=outcome.message, view=None)
+
+
+class ManagedSessionSelect(discord.ui.Select):
+    def __init__(self, actor_id: int, sessions: list[dict[str, Any]]) -> None:
+        self.actor_id = actor_id
+        self.sessions = {str(session["id"]): session for session in sessions}
+        options = []
+        for session in sessions:
+            starts_at = session.get("starts_at")
+            timestamp = (
+                starts_at.astimezone(CENTRAL).strftime("%a, %b %d at %I:%M %p Central")
+                if isinstance(starts_at, datetime)
+                else "Scheduled date"
+            )
+            options.append(discord.SelectOption(
+                label=managed_session_label(session),
+                value=str(session["id"]),
+                description=shorten(timestamp, 100),
+            ))
+        super().__init__(
+            placeholder="Choose a scheduled date to cancel…",
+            min_values=1,
+            max_values=1,
+            options=options,
+        )
+
+    async def callback(self, interaction: discord.Interaction) -> None:
+        if interaction.user.id != self.actor_id:
+            await interaction.response.send_message("This session list belongs to another member.", ephemeral=True)
+            return
+        session = self.sessions[self.values[0]]
+        starts_at = session.get("starts_at")
+        when = f"<t:{int(starts_at.timestamp())}:F>" if isinstance(starts_at, datetime) else "that date"
+        await interaction.response.send_message(
+            f"Cancel **{session.get('group_name') or 'this campaign'}** on {when}? This will notify its roster.",
+            view=ConfirmSessionCancellationView(interaction.user.id, session),
+            ephemeral=True,
+        )
+
+
+class ManagedSessionsView(discord.ui.View):
+    def __init__(self, actor_id: int, sessions: list[dict[str, Any]]) -> None:
+        super().__init__(timeout=300)
+        self.add_item(ManagedSessionSelect(actor_id, sessions))
+        self.add_item(discord.ui.Button(
+            label="Edit dates on website",
+            style=discord.ButtonStyle.link,
+            url=f"{bot.scheduling.website_url}/schedule?tab=sessions",
+        ))
+
+
+@bot.tree.command(name="sessions", description="View, edit, or cancel your scheduled campaign dates")
+async def scheduled_dates(interaction: discord.Interaction) -> None:
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    try:
+        sessions = await bot.scheduling.list_managed_sessions(str(interaction.user.id))
+    except Exception as exc:
+        log.error("Scheduled-date lookup failed: %s", type(exc).__name__)
+        await interaction.followup.send(
+            "I could not load scheduled dates. Please try again or use the scheduling website.",
+            ephemeral=True,
+        )
+        return
+    if not sessions:
+        await interaction.followup.send(
+            f"You do not have any future dates to manage. [Open the scheduler]({bot.scheduling.website_url}/schedule).",
+            ephemeral=True,
+        )
+        return
+    lines = []
+    for session in sessions:
+        starts_at = session.get("starts_at")
+        ends_at = session.get("ends_at")
+        when = f"<t:{int(starts_at.timestamp())}:F>" if isinstance(starts_at, datetime) else "Time unavailable"
+        if isinstance(ends_at, datetime):
+            when += f"–<t:{int(ends_at.timestamp())}:t>"
+        lines.append(f"• **{session.get('group_name') or 'Campaign'}** — {when}")
+    embed = discord.Embed(
+        title="Your scheduled dates",
+        description="\n".join(lines),
+        color=discord.Color.from_rgb(146, 113, 63),
+    )
+    embed.set_footer(text="Choose a date below to cancel it, or open the website to alter it.")
+    await interaction.followup.send(
+        embed=embed,
+        view=ManagedSessionsView(interaction.user.id, sessions),
+        ephemeral=True,
     )
 
 

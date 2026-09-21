@@ -62,6 +62,28 @@ class NotificationFormattingTests(unittest.TestCase):
         self.assertIn("group=group-1", rendered.url)
         self.assertIn("session=session-1", rendered.url)
 
+    def test_session_manager_receipt_has_cancel_controls(self):
+        notification = SchedulingNotification(
+            id="notification-manager",
+            recipient_discord_id="99",
+            event_type="session_confirmed",
+            payload={
+                "group_id": "group-1",
+                "session_id": "session-1",
+                "group_name": "Heroes",
+                "starts_at": "2026-10-20T20:00:00Z",
+                "ends_at": "2026-10-20T23:00:00Z",
+                "can_manage": True,
+                "manager_discord_id": "99",
+            },
+            attempt_count=1,
+        )
+
+        rendered = render_notification(notification, "https://example.com")
+
+        self.assertEqual(rendered.response_kind, "session_manager")
+        self.assertIn("session=session-1", rendered.url)
+
     def test_homebrew_submission_receipt_links_to_the_exact_post(self):
         notification = SchedulingNotification(
             id="notification-3",
@@ -208,8 +230,48 @@ class FakeInvitationConnection(FakeConnection):
             self.membership_status = params[0]
             self.membership_updates += 1
             return FakeCursor(rowcount=1)
-        if normalized.startswith("INSERT INTO notifications"):
+        if normalized.startswith("INSERT INTO notifications") and "SELECT managers.discord_id" in normalized:
             self.manager_notifications += 1
+            return FakeCursor(rowcount=1)
+        return FakeCursor(rowcount=1)
+
+
+class FakeManagedSessionConnection(FakeConnection):
+    def __init__(self):
+        super().__init__()
+        self.cancelled = False
+        self.cancel_notifications = 0
+
+    async def execute(self, query, params=None):
+        normalized = " ".join(query.split())
+        self.calls.append((normalized, params))
+        start = datetime(2026, 10, 20, 20, tzinfo=timezone.utc)
+        end = datetime(2026, 10, 20, 23, tzinfo=timezone.utc)
+        session = {
+            "id": "session-1",
+            "group_id": "group-1",
+            "group_name": "Heroes",
+            "starts_at": start,
+            "ends_at": end,
+            "timezone": "America/Chicago",
+            "revision": 2,
+            "status": "cancelled" if self.cancelled else "confirmed",
+            "owner_discord_id": "99",
+        }
+        if normalized.startswith("SELECT session_row.id"):
+            return FakeCursor([session])
+        if "SELECT session_row.*, group_row.name AS group_name" in normalized:
+            return FakeCursor([session] if params[1] == "99" else [])
+        if normalized.startswith("UPDATE sessions SET status = 'cancelled'"):
+            self.cancelled = True
+            return FakeCursor(rowcount=1)
+        if normalized.startswith("SELECT attendee.discord_id"):
+            return FakeCursor([
+                {"discord_id": "99", "display_name": "Dungeon Master"},
+                {"discord_id": "42", "display_name": "Ada"},
+            ])
+        if "VALUES (%s, 'session_cancelled'" in normalized:
+            self.cancel_notifications += 1
             return FakeCursor(rowcount=1)
         return FakeCursor(rowcount=1)
 
@@ -280,6 +342,26 @@ class SchedulingServiceDatabaseTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("already", repeated.message)
         self.assertEqual(connection.membership_updates, 1)
         self.assertEqual(connection.manager_notifications, 1)
+
+    async def test_managers_can_list_and_cancel_future_sessions(self):
+        connection = FakeManagedSessionConnection()
+        service = SchedulingService(
+            "",
+            "https://example.com",
+            pool=FakePool(connection),
+            privileged_role_ids=("dm-role", "admin-role"),
+        )
+
+        sessions = await service.list_managed_sessions("99")
+        outcome = await service.cancel_managed_session("99", "session-1", expected_revision=2)
+        repeated = await service.cancel_managed_session("99", "session-1", expected_revision=2)
+
+        self.assertEqual(len(sessions), 1)
+        self.assertEqual(sessions[0]["group_name"], "Heroes")
+        self.assertTrue(outcome.ok)
+        self.assertEqual(outcome.status, "cancelled")
+        self.assertIn("cancelled", repeated.message)
+        self.assertEqual(connection.cancel_notifications, 1)
 
 
 if __name__ == "__main__":
