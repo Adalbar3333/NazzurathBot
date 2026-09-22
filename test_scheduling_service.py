@@ -84,6 +84,40 @@ class NotificationFormattingTests(unittest.TestCase):
         self.assertEqual(rendered.response_kind, "session_manager")
         self.assertIn("session=session-1", rendered.url)
 
+    def test_date_poll_notification_links_to_poll_tab(self):
+        notification = SchedulingNotification(
+            id="poll-notification",
+            recipient_discord_id="123",
+            event_type="date_poll_opened",
+            payload={"poll_id": "poll-1", "group_name": "Heroes", "title": "October game"},
+            attempt_count=1,
+        )
+
+        rendered = render_notification(notification, "https://www.tazzurath.com/")
+
+        self.assertEqual(rendered.title, "Choose a date: October game")
+        self.assertEqual(rendered.url, "https://www.tazzurath.com/schedule?tab=polls&poll=poll-1")
+
+    def test_session_notification_includes_title_and_location(self):
+        notification = SchedulingNotification(
+            id="session-details",
+            recipient_discord_id="123",
+            event_type="session_confirmed",
+            payload={
+                "group_name": "Heroes",
+                "title": "The Frozen Gate",
+                "meeting_location": "Foundry VTT",
+                "starts_at": "2026-10-20T20:00:00Z",
+                "ends_at": "2026-10-20T23:00:00Z",
+            },
+            attempt_count=1,
+        )
+
+        rendered = render_notification(notification, "https://www.tazzurath.com")
+
+        self.assertIn("The Frozen Gate", rendered.description)
+        self.assertIn("Foundry VTT", rendered.description)
+
     def test_homebrew_submission_receipt_links_to_the_exact_post(self):
         notification = SchedulingNotification(
             id="notification-3",

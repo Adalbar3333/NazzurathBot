@@ -13,6 +13,9 @@ features, and connects the website's DM scheduling system to Discord.
   voting report, so dates follow CST/CDT daylight-saving changes automatically.
 - Keeps `/announce`, `/announce_quip`, automatic Avrae critical detection, and
   trusted-role reaction forwarding.
+- Lets any current server member use `/ping` to mention the approved active
+  members of a ping-enabled website role. Website role assignments and DM
+  approval are managed on the Tazzurath website.
 - Synchronizes current Discord members, display names, avatars, and roles to the
   website's PostgreSQL database every ten minutes. Members who leave are marked
   inactive instead of being deleted.

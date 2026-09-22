@@ -5,6 +5,7 @@ import logging
 import os
 import random
 import re
+import time as monotonic_time
 from collections import defaultdict
 from datetime import datetime, time, timedelta
 from pathlib import Path
@@ -83,6 +84,8 @@ EMBED_COLORS = {
 }
 
 reaction_tracker = defaultdict(lambda: {"success": set(), "fail": set()})
+ping_user_cooldowns: dict[int, float] = {}
+ping_role_cooldowns: dict[str, float] = {}
 
 
 def load_quips() -> list[str]:
@@ -571,6 +574,99 @@ async def has_admin_role(interaction: discord.Interaction) -> bool:
     return isinstance(interaction.user, discord.Member) and any(
         role.id == ADMIN_ROLE_ID for role in interaction.user.roles
     )
+
+
+async def website_role_autocomplete(
+    interaction: discord.Interaction,
+    current: str,
+) -> list[app_commands.Choice[str]]:
+    if interaction.guild_id != DISCORD_GUILD_ID or not bot.scheduling.configured:
+        return []
+    try:
+        roles = await bot.scheduling.list_ping_website_roles(current)
+    except Exception as exc:
+        log.error("Website role autocomplete failed: %s", type(exc).__name__)
+        return []
+    return [app_commands.Choice(name=role["name"], value=role["id"]) for role in roles]
+
+
+def ping_message_chunks(role_name: str, actor_mention: str, member_ids: list[str], message: str) -> list[str]:
+    safe_message = re.sub(r"@", "@\u200b", shorten(message, 500))
+    header = f"**{role_name}** — requested by {actor_mention}"
+    if safe_message:
+        header += f"\n{safe_message}"
+    chunks: list[str] = []
+    current = header
+    for member_id in member_ids:
+        mention = f"<@{member_id}>"
+        candidate = f"{current}\n{mention}"
+        if len(candidate) > 1950:
+            chunks.append(current)
+            current = mention
+        else:
+            current = candidate
+    if current:
+        chunks.append(current)
+    return chunks
+
+
+@bot.tree.command(name="ping", description="Ping the approved members of a Tazzurath website role")
+@app_commands.describe(role="Website role to ping", message="Optional reason for the ping")
+@app_commands.autocomplete(role=website_role_autocomplete)
+async def ping_website_role(
+    interaction: discord.Interaction,
+    role: str,
+    message: str = "",
+) -> None:
+    if interaction.guild_id != DISCORD_GUILD_ID or not isinstance(interaction.user, discord.Member):
+        await interaction.response.send_message("This command is available only in the Tazzurath Discord server.", ephemeral=True)
+        return
+    if not bot.scheduling.configured:
+        await interaction.response.send_message("Website roles are not configured yet.", ephemeral=True)
+        return
+
+    now = monotonic_time.monotonic()
+    is_admin = await has_admin_role(interaction)
+    user_remaining = 60 - (now - ping_user_cooldowns.get(interaction.user.id, 0))
+    role_remaining = 300 - (now - ping_role_cooldowns.get(role, 0))
+    if user_remaining > 0:
+        await interaction.response.send_message(f"Please wait {int(user_remaining) + 1} seconds before using another website-role ping.", ephemeral=True)
+        return
+    if role_remaining > 0 and not is_admin:
+        await interaction.response.send_message(f"That role was pinged recently. Try again in {int(role_remaining) + 1} seconds.", ephemeral=True)
+        return
+
+    await interaction.response.defer(thinking=True)
+    try:
+        resolved = await bot.scheduling.resolve_website_role_ping(role)
+        if resolved is None:
+            await interaction.followup.send("That website role is unavailable or no longer ping-enabled.", ephemeral=True)
+            return
+        role_record, member_ids = resolved
+        current_member_ids = {str(member.id) for member in interaction.guild.members}
+        member_ids = [member_id for member_id in member_ids if member_id in current_member_ids]
+        if not member_ids:
+            await interaction.followup.send(f"**{role_record['name']}** has no approved active members to ping.", ephemeral=True)
+            return
+
+        allowed_mentions = discord.AllowedMentions(everyone=False, roles=False, users=True, replied_user=False)
+        chunks = ping_message_chunks(role_record["name"], interaction.user.mention, member_ids, message)
+        await interaction.followup.send(chunks[0], allowed_mentions=allowed_mentions)
+        for chunk in chunks[1:]:
+            await interaction.channel.send(chunk, allowed_mentions=allowed_mentions)
+
+        ping_user_cooldowns[interaction.user.id] = now
+        ping_role_cooldowns[role] = now
+        await bot.scheduling.audit_website_role_ping(
+            actor_discord_id=str(interaction.user.id),
+            role_id=role_record["id"],
+            channel_id=str(interaction.channel_id),
+            member_count=len(member_ids),
+            message=shorten(message, 500),
+        )
+    except Exception as exc:
+        log.error("Website role ping failed: %s", type(exc).__name__)
+        await interaction.followup.send("I could not resolve that website role right now.", ephemeral=True)
 
 
 @bot.tree.command(name="announce", description="Announce a message in a channel")

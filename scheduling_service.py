@@ -114,6 +114,15 @@ def _homebrew_url(website_url: str, payload: Mapping[str, Any], settled: bool = 
     return f"{base}#homebrew-post-{post_id}" if post_id else base
 
 
+def _session_description(payload: Mapping[str, Any], group_name: str, when: str, prefix: str) -> str:
+    session_title = _clean(payload.get("title"), "Session")
+    location = str(_value(payload, "meeting_location", "meetingLocation") or "").strip()
+    description = f"{prefix} **{session_title}** for **{group_name}** {when}."
+    if location:
+        description += f"\n**Where:** {location}"
+    return description
+
+
 def render_notification(
     notification: SchedulingNotification,
     website_url: str,
@@ -187,14 +196,14 @@ def render_notification(
     if event_type in {"session_confirmed", "session_proposal"}:
         return RenderedNotification(
             title="New session scheduled",
-            description=f"**{group_name}** has a session scheduled for {when}.",
+            description=_session_description(payload, group_name, when, "A new session was scheduled:"),
             url=url,
             response_kind="session_manager" if payload.get("can_manage") is True else "session",
         )
     if event_type == "session_rescheduled":
         return RenderedNotification(
             title="Session rescheduled",
-            description=f"The **{group_name}** session is now scheduled for {when}. Please respond again.",
+            description=_session_description(payload, group_name, when, "The updated session is:") + " Please respond again.",
             url=url,
             response_kind="session_manager" if payload.get("can_manage") is True else "session",
         )
@@ -227,6 +236,15 @@ def render_notification(
                 "The notification is still available on the website."
             ),
             url=url,
+        )
+
+    if event_type == "date_poll_opened":
+        poll_id = _clean(payload.get("poll_id"), "")
+        poll_title = _clean(payload.get("title"), "Next session")
+        return RenderedNotification(
+            title=f"Choose a date: {poll_title}",
+            description=_clean(payload.get("message"), f"Vote on the proposed dates for **{group_name}**."),
+            url=f"{website_url.rstrip('/')}/schedule?tab=polls&poll={poll_id}",
         )
 
     return RenderedNotification(
@@ -613,6 +631,106 @@ class SchedulingService:
             self.last_member_sync_at = datetime.now(timezone.utc)
             self._record_success()
             return len(records)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def list_ping_website_roles(self, query: str = "", limit: int = 25) -> list[dict[str, Any]]:
+        if not await self.ensure_connected():
+            return []
+        assert self.pool is not None
+        clean_query = str(query or "").strip()
+        try:
+            async with self.pool.connection() as conn:
+                cursor = await conn.execute(
+                    """
+                    SELECT id::text, slug, name, color, role_type
+                    FROM website_roles
+                    WHERE active = TRUE AND ping_enabled = TRUE
+                      AND (%s = '' OR name ILIKE '%%' || %s || '%%' OR slug ILIKE '%%' || %s || '%%')
+                    ORDER BY name
+                    LIMIT %s
+                    """,
+                    (clean_query, clean_query, clean_query, max(1, min(int(limit), 25))),
+                )
+                rows = await cursor.fetchall()
+            self._record_success()
+            return list(rows)
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def resolve_website_role_ping(self, role_id: str) -> tuple[dict[str, Any], list[str]] | None:
+        if not await self.ensure_connected():
+            return None
+        assert self.pool is not None
+        try:
+            async with self.pool.connection() as conn:
+                role_cursor = await conn.execute(
+                    """
+                    SELECT id::text, slug, name, color, role_type
+                    FROM website_roles
+                    WHERE id = %s::uuid AND active = TRUE AND ping_enabled = TRUE
+                    """,
+                    (role_id,),
+                )
+                role = await role_cursor.fetchone()
+                if role is None:
+                    return None
+                member_cursor = await conn.execute(
+                    """
+                    SELECT DISTINCT membership.discord_id
+                    FROM website_role_memberships AS membership
+                    JOIN discord_members AS member ON member.discord_id = membership.discord_id
+                    WHERE membership.role_id = %s::uuid
+                      AND membership.status = 'approved'
+                      AND member.active = TRUE
+                      AND (
+                        %s <> 'dm_scope'
+                        OR member.role_ids ?| %s::text[]
+                      )
+                    ORDER BY membership.discord_id
+                    """,
+                    (role_id, role["role_type"], list(self.privileged_role_ids)),
+                )
+                members = [str(row["discord_id"]) for row in await member_cursor.fetchall()]
+            self._record_success()
+            return role, members
+        except Exception as exc:
+            self._record_failure(exc)
+            raise
+
+    async def audit_website_role_ping(
+        self,
+        *,
+        actor_discord_id: str,
+        role_id: str,
+        channel_id: str,
+        member_count: int,
+        message: str,
+    ) -> None:
+        if not await self.ensure_connected():
+            return
+        assert self.pool is not None
+        try:
+            async with self.pool.connection() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO website_role_audit_log
+                      (actor_discord_id, action, role_id, details)
+                    VALUES (%s, 'role.pinged', %s::uuid, %s)
+                    """,
+                    (
+                        actor_discord_id,
+                        role_id,
+                        Jsonb({
+                            "channel_id": channel_id,
+                            "member_count": member_count,
+                            "message": message,
+                        }),
+                    ),
+                )
+            self._record_success()
         except Exception as exc:
             self._record_failure(exc)
             raise
