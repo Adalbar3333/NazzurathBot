@@ -6,20 +6,11 @@ features, and connects the website's DM scheduling system to Discord.
 
 ## What it does
 
-- Checks `Adalbar3333/Tazzurath-Website` once per minute. A new website
-  submission (a GitHub Issue with the `tazzurath-homebrew` label) is posted in
-  Discord channel `1548461625865015466`.
-- At 6:00 AM Central Time, posts every undecided proposal that members can
-  currently vote on, including weighted approve/disapprove totals, plus every
-  proposal approved or denied since the previous voting update.
-- At 12:00 PM Central Time, posts every Markdown page added under `content/` on
-  the website's `main` branch since local midnight. It says nothing when no page
-  was added.
-- Uses `America/Chicago`, so the schedule follows CST/CDT daylight-saving
-  changes automatically.
-- If the process was briefly offline at the scheduled minute, it sends the
-  missed report after reconnecting. Discord footer markers prevent duplicate
-  daily reports after a restart.
+- Never posts homebrew or page reports merely because the bot started or
+  reconnected. Administrators explicitly request channel posts with
+  `/homebrew_post`, `/homebrew_voting_update`, or `/homebrew_pages_update`.
+- Uses `America/Chicago` when an administrator requests a same-day page or
+  voting report, so dates follow CST/CDT daylight-saving changes automatically.
 - Keeps `/announce`, `/announce_quip`, automatic Avrae critical detection, and
   trusted-role reaction forwarding.
 - Synchronizes current Discord members, display names, avatars, and roles to the
@@ -116,11 +107,9 @@ python -m unittest -v
 python nazzurath.py
 ```
 
-A successful start logs `Logged in as ...`. On its first run, the bot records
-existing registry items without flooding the channel, then checks for new
-submissions every minute. Set `ANNOUNCE_EXISTING_SUBMISSIONS=true` if you want
-the first run to post all existing items. Global slash commands can take a
-little time to appear after the first start.
+A successful start logs `Logged in as ...`. Starting or reconnecting the bot
+does not post anything to the homebrew channel. Global slash commands can take
+a little time to appear after the first start.
 
 Never commit `.env`; it is intentionally ignored by Git and Docker.
 
@@ -183,8 +172,8 @@ small, low-CPU bot.
   channel permissions and ID.
 - **No new-page links:** verify `GITHUB_BRANCH=main`; only newly added
   `content/**/*.md` files count, not edits to existing pages.
-- **No 6 AM message:** this is expected when every proposal is already approved
-  or disapproved.
+- **No automatic homebrew message:** this is intentional. An administrator must
+  run one of the `/homebrew_*` posting commands.
 - **Scheduling is disabled:** set `DATABASE_URL` and `DISCORD_GUILD_ID`; the
   `/health` response reports configuration, database health, worker state, and
   last successful worker timestamps without exposing schedule data.

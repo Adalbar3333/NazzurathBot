@@ -4,6 +4,7 @@ import hmac
 import json
 import unittest
 from datetime import datetime, timezone
+from pathlib import Path
 
 from github_service import (
     EVENT_TAG,
@@ -12,8 +13,8 @@ from github_service import (
     apply_comments,
     decode_tagged_body,
     page_from_path,
-    proposals_resolved_since,
     proposal_from_issue,
+    proposals_resolved_since,
 )
 
 
@@ -139,6 +140,18 @@ class GitHubServiceAsyncTests(unittest.IsolatedAsyncioTestCase):
             datetime(2026, 9, 13, tzinfo=timezone.utc),
         )
         self.assertEqual([page.title for page in pages], ["New Page", "Old Page"])
+
+
+class HomebrewPostingPolicyTests(unittest.TestCase):
+    def test_homebrew_channel_posts_are_manual_only(self):
+        source = Path(__file__).with_name("nazzurath.py").read_text(encoding="utf-8")
+
+        self.assertNotIn("homebrew_monitor.start()", source)
+        self.assertNotIn("scheduled_reports.start()", source)
+        self.assertNotIn("@tasks.loop(seconds=60)\nasync def homebrew_monitor", source)
+        self.assertIn('name="homebrew_post"', source)
+        self.assertIn('name="homebrew_voting_update"', source)
+        self.assertIn('name="homebrew_pages_update"', source)
 
 
 if __name__ == "__main__":

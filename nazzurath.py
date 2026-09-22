@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-import asyncio
 import json
 import logging
 import os
@@ -50,13 +49,6 @@ def env_int(name: str, default: int) -> int:
         raise RuntimeError(f"{name} must be a Discord numeric ID") from exc
 
 
-def env_bool(name: str, default: bool = False) -> bool:
-    value = os.getenv(name)
-    if value is None:
-        return default
-    return value.strip().lower() in {"1", "true", "yes", "on"}
-
-
 TOKEN = os.getenv("DISCORD_TOKEN", "")
 HOMEBREW_CHANNEL_ID = env_int("HOMEBREW_CHANNEL_ID", 1548461625865015466)
 HOMEBREW_ROLE_ID = env_int("HOMEBREW_ROLE_ID", 0)
@@ -71,8 +63,6 @@ DISCORD_DM_ROLE_ID = env_int("DISCORD_DM_ROLE_ID", 0)
 QUIP_FILE = Path(os.getenv("QUIP_FILE", str(BASE_DIR / "quips.json")))
 
 CENTRAL = ZoneInfo("America/Chicago")
-POLL_SECONDS = max(30, env_int("GITHUB_POLL_SECONDS", 60))
-ANNOUNCE_EXISTING_SUBMISSIONS = env_bool("ANNOUNCE_EXISTING_SUBMISSIONS")
 NOTIFICATION_POLL_SECONDS = max(5, env_int("SCHEDULING_POLL_SECONDS", 15))
 
 CRIT_SUCCESS_EMOJI = discord.PartialEmoji(name="criticalSuccess", id=1361065140031848479)
@@ -141,10 +131,6 @@ class NazzurathBot(commands.Bot):
         self.github = GitHubService.from_env()
         self.scheduling = SchedulingService.from_env()
         self.health_runner: web.AppRunner | None = None
-        self.report_lock = asyncio.Lock()
-        self.completed_vote_dates: set[str] = set()
-        self.completed_pages_dates: set[str] = set()
-        self.known_proposal_ids: set[int] | None = None
 
     async def setup_hook(self) -> None:
         await self.github.start()
@@ -153,19 +139,12 @@ class NazzurathBot(commands.Bot):
         self.add_view(SessionResponseView(self))
         self.add_view(SessionManagerView(self))
         await self.start_health_server()
-        homebrew_monitor.change_interval(seconds=POLL_SECONDS)
-        homebrew_monitor.start()
-        scheduled_reports.start()
         scheduling_notification_worker.change_interval(seconds=NOTIFICATION_POLL_SECONDS)
         scheduling_notification_worker.start()
         scheduling_member_sync.start()
         await self.tree.sync()
 
     async def close(self) -> None:
-        if homebrew_monitor.is_running():
-            homebrew_monitor.cancel()
-        if scheduled_reports.is_running():
-            scheduled_reports.cancel()
         if scheduling_notification_worker.is_running():
             scheduling_notification_worker.cancel()
         if scheduling_member_sync.is_running():
@@ -716,24 +695,6 @@ async def forward_embed(original_message: discord.Message, embed: discord.Embed,
     await channel.send(f"{message_text}\n[Jump to message]({original_message.jump_url})", embed=embed)
 
 
-async def announced_issue_numbers(channel: discord.TextChannel, after: datetime | None = None) -> set[int]:
-    numbers: set[int] = set()
-    async for message in channel.history(limit=None if after else 200, after=after):
-        for embed in message.embeds:
-            footer = embed.footer.text or ""
-            match = re.fullmatch(r"NazzurathBot:homebrew:(\d+)", footer)
-            if match:
-                numbers.add(int(match.group(1)))
-    return numbers
-
-
-async def report_marker_exists(channel: discord.TextChannel, marker: str, after: datetime) -> bool:
-    async for message in channel.history(limit=100, after=after):
-        if any(embed.footer.text == marker for embed in message.embeds):
-            return True
-    return False
-
-
 async def latest_report_time(channel: discord.TextChannel, marker_prefix: str) -> datetime | None:
     async for message in channel.history(limit=500):
         if any((embed.footer.text or "").startswith(marker_prefix) for embed in message.embeds):
@@ -769,19 +730,15 @@ async def announce_proposal(channel: discord.TextChannel, proposal: Proposal) ->
     )
 
 
-async def send_vote_report(channel: discord.TextChannel, now: datetime) -> None:
+async def send_vote_report(channel: discord.TextChannel, now: datetime) -> bool:
     marker = f"NazzurathBot:vote-report:{now.date().isoformat()}"
-    midnight = datetime.combine(now.date(), time.min, tzinfo=CENTRAL)
-    if await report_marker_exists(channel, marker, midnight):
-        return
     previous_report_at = await latest_report_time(channel, "NazzurathBot:vote-report:")
     resolution_cutoff = previous_report_at or (now - timedelta(days=1))
     proposals = await bot.github.list_proposals(include_comments=True)
     voteable = [proposal for proposal in proposals if proposal.status not in {"approved", "disapproved"}]
     resolved = proposals_resolved_since(proposals, resolution_cutoff)
     if not voteable and not resolved:
-        log.info("No voteable or newly resolved proposals; no 6 AM message sent")
-        return
+        return False
 
     lines: list[str] = []
     if resolved:
@@ -813,17 +770,15 @@ async def send_vote_report(channel: discord.TextChannel, now: datetime) -> None:
         )
         embed.set_footer(text=marker)
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    return True
 
 
-async def send_pages_report(channel: discord.TextChannel, now: datetime) -> None:
+async def send_pages_report(channel: discord.TextChannel, now: datetime) -> bool:
     marker = f"NazzurathBot:pages-report:{now.date().isoformat()}"
     midnight = datetime.combine(now.date(), time.min, tzinfo=CENTRAL)
-    if await report_marker_exists(channel, marker, midnight):
-        return
     pages = await bot.github.new_pages_between(midnight, now)
     if not pages:
-        log.info("No new pages; no noon message sent")
-        return
+        return False
 
     lines = [f"• [{discord.utils.escape_markdown(shorten(page.title, 120))}]({page.url})" for page in pages]
     for index, description in enumerate(chunk_lines(lines)):
@@ -835,57 +790,62 @@ async def send_pages_report(channel: discord.TextChannel, now: datetime) -> None
         )
         embed.set_footer(text=marker)
         await channel.send(embed=embed, allowed_mentions=discord.AllowedMentions.none())
+    return True
 
 
-@tasks.loop(seconds=60)
-async def homebrew_monitor() -> None:
+async def begin_manual_homebrew_post(interaction: discord.Interaction) -> bool:
+    if not await has_admin_role(interaction):
+        await interaction.response.send_message("You do not have permission to post homebrew updates.", ephemeral=True)
+        return False
     if not bot.github.configured:
+        await interaction.response.send_message("The GitHub homebrew connection is not configured.", ephemeral=True)
+        return False
+    await interaction.response.defer(ephemeral=True, thinking=True)
+    return True
+
+
+@bot.tree.command(name="homebrew_post", description="Post one homebrew submission to the homebrew channel")
+@app_commands.describe(issue_number="The homebrew proposal number shown in the registry")
+async def homebrew_post(interaction: discord.Interaction, issue_number: int) -> None:
+    if not await begin_manual_homebrew_post(interaction):
         return
     try:
-        channel = await bot.homebrew_channel()
         proposals = await bot.github.list_proposals(include_comments=False)
-        if bot.known_proposal_ids is None:
-            earliest = min((proposal.created_at for proposal in proposals), default=None)
-            bot.known_proposal_ids = await announced_issue_numbers(channel, after=earliest)
-            if not bot.known_proposal_ids and not ANNOUNCE_EXISTING_SUBMISSIONS:
-                bot.known_proposal_ids.update(proposal.number for proposal in proposals)
-                log.info("Recorded %s existing proposals without announcing them", len(proposals))
-                return
-        for proposal in sorted(proposals, key=lambda item: item.number):
-            if proposal.number not in bot.known_proposal_ids:
-                await announce_proposal(channel, proposal)
-                bot.known_proposal_ids.add(proposal.number)
+        proposal = next((item for item in proposals if item.number == issue_number), None)
+        if proposal is None:
+            await interaction.followup.send(f"Homebrew proposal #{issue_number} was not found.", ephemeral=True)
+            return
+        await announce_proposal(await bot.homebrew_channel(), proposal)
+        await interaction.followup.send(f"Posted homebrew proposal #{issue_number}.", ephemeral=True)
     except (GitHubError, discord.DiscordException, RuntimeError) as exc:
-        log.error("Homebrew monitor failed: %s", exc)
+        log.error("Manual homebrew post failed: %s", exc)
+        await interaction.followup.send("I could not post that homebrew proposal.", ephemeral=True)
 
 
-@homebrew_monitor.before_loop
-async def before_homebrew_monitor() -> None:
-    await bot.wait_until_ready()
-
-
-@tasks.loop(seconds=60)
-async def scheduled_reports() -> None:
-    if not bot.github.configured or bot.report_lock.locked():
+@bot.tree.command(name="homebrew_voting_update", description="Post the current homebrew voting report")
+async def homebrew_voting_update(interaction: discord.Interaction) -> None:
+    if not await begin_manual_homebrew_post(interaction):
         return
-    now = datetime.now(CENTRAL)
-    date_key = now.date().isoformat()
     try:
-        async with bot.report_lock:
-            channel = await bot.homebrew_channel()
-            if now.hour >= 6 and date_key not in bot.completed_vote_dates:
-                await send_vote_report(channel, now)
-                bot.completed_vote_dates.add(date_key)
-            if now.hour >= 12 and date_key not in bot.completed_pages_dates:
-                await send_pages_report(channel, now)
-                bot.completed_pages_dates.add(date_key)
+        posted = await send_vote_report(await bot.homebrew_channel(), datetime.now(CENTRAL))
+        message = "Posted the homebrew voting update." if posted else "There are no open or newly resolved proposals to post."
+        await interaction.followup.send(message, ephemeral=True)
     except (GitHubError, discord.DiscordException, RuntimeError) as exc:
-        log.error("Scheduled report failed: %s", exc)
+        log.error("Manual homebrew voting update failed: %s", exc)
+        await interaction.followup.send("I could not post the homebrew voting update.", ephemeral=True)
 
 
-@scheduled_reports.before_loop
-async def before_scheduled_reports() -> None:
-    await bot.wait_until_ready()
+@bot.tree.command(name="homebrew_pages_update", description="Post today's newly published website pages")
+async def homebrew_pages_update(interaction: discord.Interaction) -> None:
+    if not await begin_manual_homebrew_post(interaction):
+        return
+    try:
+        posted = await send_pages_report(await bot.homebrew_channel(), datetime.now(CENTRAL))
+        message = "Posted today's new-page update." if posted else "There are no new pages to post today."
+        await interaction.followup.send(message, ephemeral=True)
+    except (GitHubError, discord.DiscordException, RuntimeError) as exc:
+        log.error("Manual new-page update failed: %s", exc)
+        await interaction.followup.send("I could not post the new-page update.", ephemeral=True)
 
 
 @tasks.loop(seconds=15)
